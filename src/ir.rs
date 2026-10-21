@@ -585,4 +585,26 @@ mod tests {
         let p = lower_source("int main(){return 2+3*4;}");
         assert!(p.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Const { value: 14, .. })));
     }
+
+    #[test]
+    fn promotes_branch_assigned_local_to_ssa_phi() {
+        let ast = Parser::new(lex("int main(){int x=1;if(x<2)x=x+3;else x=x+4;return x;}").unwrap()).parse().unwrap();
+        let mut p = lower(&sema::analyze(&ast).unwrap());
+        promote_locals_to_ssa(&mut p);
+        assert!(!p.blocks.iter().flat_map(|b| &b.instructions).any(|i|
+            matches!(i, Instruction::LoadLocal { .. } | Instruction::StoreLocal { .. })));
+        assert!(p.blocks.iter().flat_map(|b| &b.instructions).any(|i|
+            matches!(i, Instruction::Phi { incoming, .. } if incoming.len() == 2)));
+    }
+
+    #[test]
+    fn promotes_loop_carried_local_to_ssa_phi() {
+        let ast = Parser::new(lex("int main(){int x=0;while(x<5)x=x+1;return x;}").unwrap()).parse().unwrap();
+        let mut p = lower(&sema::analyze(&ast).unwrap());
+        promote_locals_to_ssa(&mut p);
+        assert!(!p.blocks.iter().flat_map(|b| &b.instructions).any(|i|
+            matches!(i, Instruction::LoadLocal { .. } | Instruction::StoreLocal { .. })));
+        assert!(p.blocks.iter().flat_map(|b| &b.instructions).any(|i|
+            matches!(i, Instruction::Phi { incoming, .. } if incoming.len() >= 2)));
+    }
 }
