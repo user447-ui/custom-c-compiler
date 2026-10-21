@@ -26,6 +26,8 @@ pub enum Instruction {
     Unary { dst: ValueId, op: IrUnary, src: ValueId },
     Binary { dst: ValueId, op: IrBinary, lhs: ValueId, rhs: ValueId },
     ToBool { dst: ValueId, src: ValueId },
+    /// Merge values arriving from distinct predecessor blocks (SSA phi node).
+    Phi { dst: ValueId, incoming: Vec<(BlockId, ValueId)> },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -86,7 +88,7 @@ pub fn optimize(mut program: IrProgram) -> IrProgram {
                         *inst = Instruction::Const { dst, value }; constants.insert(dst, value);
                     } else { constants.remove(&dst); }
                 }
-                Instruction::LoadLocal { dst, .. } => { constants.remove(&dst); }
+                Instruction::LoadLocal { dst, .. } | Instruction::Phi { dst, .. } => { constants.remove(&dst); }
                 Instruction::StoreLocal { .. } => {}
             }
         }
@@ -122,7 +124,7 @@ fn simplify_constant_branches(program: &mut IrProgram) {
                 Instruction::ToBool { dst, src } => {
                     if let Some(n) = constants.get(src).copied() { constants.insert(*dst, i64::from(n != 0)); }
                 }
-                Instruction::LoadLocal { dst, .. } => { constants.remove(dst); }
+                Instruction::LoadLocal { dst, .. } | Instruction::Phi { dst, .. } => { constants.remove(dst); }
                 Instruction::StoreLocal { .. } => {}
             }
         }
@@ -159,6 +161,12 @@ fn remove_unreachable_blocks(program: &mut IrProgram) {
     }
     for block in &mut blocks {
         block.id = remap[block.id];
+        for inst in &mut block.instructions {
+            if let Instruction::Phi { incoming, .. } = inst {
+                incoming.retain(|(pred, _)| *pred < remap.len() && remap[*pred] != usize::MAX);
+                for (pred, _) in incoming.iter_mut() { *pred = remap[*pred]; }
+            }
+        }
         block.terminator = block.terminator.map(|term| match term {
             Terminator::Jump(target) => Terminator::Jump(remap[target]),
             Terminator::Branch { condition, if_zero, if_nonzero } => Terminator::Branch {
@@ -178,6 +186,9 @@ fn eliminate_dead_values(program: &mut IrProgram) {
             for inst in &block.instructions {
                 match inst {
                     Instruction::LoadLocal { .. } | Instruction::Const { .. } => {}
+                    Instruction::Phi { incoming, .. } => {
+                        for (_, value) in incoming { if let Some(n) = uses.get_mut(*value) { *n += 1; } }
+                    }
                     Instruction::StoreLocal { src, .. } | Instruction::ToBool { src, .. } => {
                         if let Some(n) = uses.get_mut(*src) { *n += 1; }
                     }
@@ -203,7 +214,7 @@ fn eliminate_dead_values(program: &mut IrProgram) {
                 Instruction::StoreLocal { .. } => true,
                 Instruction::Const { dst, .. } | Instruction::LoadLocal { dst, .. } |
                 Instruction::Unary { dst, .. } | Instruction::Binary { dst, .. } |
-                Instruction::ToBool { dst, .. } => uses.get(*dst).copied().unwrap_or(0) != 0,
+                Instruction::ToBool { dst, .. } | Instruction::Phi { dst, .. } => uses.get(*dst).copied().unwrap_or(0) != 0,
             });
         }
         let after: usize = program.blocks.iter().map(|b| b.instructions.len()).sum();
@@ -331,13 +342,18 @@ impl Builder {
         let (if_zero, if_nonzero) = if is_and { (short_block, rhs_block) } else { (rhs_block, short_block) };
         self.terminate(Terminator::Branch { condition: lhs, if_zero, if_nonzero });
         self.current = short_block;
-        self.emit(Instruction::Const { dst: result, value: i64::from(!is_and) });
+        let short_value = self.constant(i64::from(!is_and));
         self.terminate(Terminator::Jump(merge_block));
         self.current = rhs_block;
         let rhs = self.expression(right);
-        self.emit(Instruction::ToBool { dst: result, src: rhs });
+        let rhs_value = self.value();
+        self.emit(Instruction::ToBool { dst: rhs_value, src: rhs });
         self.terminate(Terminator::Jump(merge_block));
         self.current = merge_block;
+        self.emit(Instruction::Phi {
+            dst: result,
+            incoming: vec![(short_block, short_value), (rhs_block, rhs_value)],
+        });
         result
     }
 }
@@ -369,6 +385,12 @@ mod tests {
         let p = lower_source("int main(){int x=1;if(0){x=99;}return x;}");
         assert!(!p.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Const { value: 99, .. })));
         assert!(p.blocks.iter().all(|b| b.terminator.is_some()));
+    }
+    #[test]
+    fn short_circuit_result_uses_phi_node() {
+        let ast = Parser::new(lex("int main(){int x=2;return x && 3;}").unwrap()).parse().unwrap();
+        let p = lower(&sema::analyze(&ast).unwrap());
+        assert!(p.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Phi { incoming, .. } if incoming.len() == 2)));
     }
     #[test]
     fn folds_constants_inside_blocks() {
