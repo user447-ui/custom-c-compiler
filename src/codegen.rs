@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use crate::ir::{BlockId, Instruction, IrBinary, IrProgram, IrUnary, Terminator, ValueId};
+use crate::regalloc::{self, Allocation, Location};
 
 pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
     if program.blocks.is_empty() || program.entry >= program.blocks.len() {
@@ -13,12 +14,19 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
         }
         next_slot += 1;
     }
-    let mut value_slots = Vec::with_capacity(program.value_count);
-    for _ in 0..program.value_count {
-        value_slots.push(next_slot * 8);
-        next_slot += 1;
+    let allocation = regalloc::allocate(program);
+    let spill_base = (next_slot - 1) * 8;
+    let mut phi_stage_slots = HashMap::new();
+    for block in &program.blocks {
+        for instruction in &block.instructions {
+            if let Instruction::Phi { dst, .. } = instruction {
+                let stage_index = program.locals.len() + allocation.spill_count + phi_stage_slots.len() + 1;
+                phi_stage_slots.insert(*dst, stage_index as i32 * 8);
+            }
+        }
     }
-    let frame = (((next_slot as usize - 1) * 8 + 15) / 16 * 16) as u32;
+    let frame_slots = program.locals.len() + allocation.spill_count + phi_stage_slots.len();
+    let frame = ((frame_slots * 8 + 15) / 16 * 16) as u32;
     // Phi assignments are edge-specific. Redirect only those edges through
     // tiny copy blocks so a conditional branch never executes the other edge's copies.
     let mut edge_trampolines = Vec::<(BlockId, BlockId)>::new();
@@ -43,12 +51,12 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
     let edge_targets: HashMap<(BlockId, BlockId), BlockId> = edge_trampolines.iter().enumerate()
         .map(|(i, edge)| (*edge, program.blocks.len() + i)).collect();
     let mut g = Generator {
-        code: Vec::new(), local_slots, value_slots,
+        code: Vec::new(), local_slots, allocation, spill_base, phi_stage_slots,
         block_offsets: vec![usize::MAX; program.blocks.len() + edge_trampolines.len()],
         patches: Vec::new(), edge_targets, current_block: program.entry,
     };
-    // Function prologue. Every IR value has a stable stack home; phi nodes
-    // are lowered to copies on the incoming control-flow edges.
+    // Long-lived SSA values use allocated registers; excess values spill to stack.
+    // Phi copies are staged to preserve parallel-copy semantics.
     g.code.extend_from_slice(&[0x55, 0x48, 0x89, 0xe5]);
     if frame != 0 {
         g.code.extend_from_slice(&[0x48, 0x81, 0xec]);
@@ -69,14 +77,21 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
     for (index, (predecessor, target)) in edge_trampolines.iter().copied().enumerate() {
         let synthetic = program.blocks.len() + index;
         g.block_offsets[synthetic] = g.code.len();
+        // Stage all sources first, then write destinations, so phi copies are parallel.
         for instruction in &program.blocks[target].instructions {
             if let Instruction::Phi { dst, incoming } = instruction {
                 if let Some((_, src)) = incoming.iter().find(|(pred, _)| *pred == predecessor) {
-                    let src_slot = g.value(*src)?;
-                    let dst_slot = g.value(*dst)?;
-                    g.load_rax(src_slot);
-                    g.store_rax(dst_slot);
+                    g.load_value_rax(*src)?;
+                    let stage = *g.phi_stage_slots.get(dst).ok_or("invalid IR: missing phi staging slot")?;
+                    g.store_rax(stage);
                 }
+            }
+        }
+        for instruction in &program.blocks[target].instructions {
+            if let Instruction::Phi { dst, .. } = instruction {
+                let stage = *g.phi_stage_slots.get(dst).ok_or("invalid IR: missing phi staging slot")?;
+                g.load_rax(stage);
+                g.store_rax_value(*dst)?;
             }
         }
         g.jump(&[0xe9], target);
@@ -94,7 +109,9 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
 struct Generator {
     code: Vec<u8>,
     local_slots: HashMap<String, i32>,
-    value_slots: Vec<i32>,
+    allocation: Allocation,
+    spill_base: i32,
+    phi_stage_slots: HashMap<ValueId, i32>,
     block_offsets: Vec<usize>,
     patches: Vec<(usize, BlockId)>,
     edge_targets: HashMap<(BlockId, BlockId), BlockId>,
@@ -105,9 +122,40 @@ impl Generator {
         self.local_slots.get(name).copied()
             .ok_or_else(|| format!("invalid IR: unknown local '{name}'"))
     }
-    fn value(&self, id: ValueId) -> Result<i32, String> {
-        self.value_slots.get(id).copied()
+    fn location(&self, id: ValueId) -> Result<Location, String> {
+        self.allocation.locations.get(id).copied()
             .ok_or_else(|| format!("invalid IR: value %{id} out of range"))
+    }
+    fn spill_displacement(&self, slot: usize) -> i32 { self.spill_base + (slot as i32 + 1) * 8 }
+    fn load_value_rax(&mut self, id: ValueId) -> Result<(), String> {
+        match self.location(id)? {
+            Location::Spill(slot) => self.load_rax(self.spill_displacement(slot)),
+            Location::Register(reg) => {
+                let rex = 0x48 | if reg >= 8 { 0x04 } else { 0 };
+                self.code.extend_from_slice(&[rex, 0x89, 0xc0 | ((reg & 7) << 3)]);
+            }
+        }
+        Ok(())
+    }
+    fn load_value_rcx(&mut self, id: ValueId) -> Result<(), String> {
+        match self.location(id)? {
+            Location::Spill(slot) => self.load_rcx(self.spill_displacement(slot)),
+            Location::Register(reg) => {
+                let rex = 0x48 | if reg >= 8 { 0x04 } else { 0 };
+                self.code.extend_from_slice(&[rex, 0x89, 0xc1 | ((reg & 7) << 3)]);
+            }
+        }
+        Ok(())
+    }
+    fn store_rax_value(&mut self, id: ValueId) -> Result<(), String> {
+        match self.location(id)? {
+            Location::Spill(slot) => self.store_rax(self.spill_displacement(slot)),
+            Location::Register(reg) => {
+                let rex = 0x48 | if reg >= 8 { 0x01 } else { 0 };
+                self.code.extend_from_slice(&[rex, 0x89, 0xc0 | (reg & 7)]);
+            }
+        }
+        Ok(())
     }
     fn load_rax(&mut self, displacement: i32) {
         self.code.extend_from_slice(&[0x48, 0x8b, 0x85]);
@@ -135,34 +183,34 @@ impl Generator {
             Instruction::Const { dst, value } => {
                 self.code.extend_from_slice(&[0x48, 0xb8]);
                 self.code.extend_from_slice(&value.to_le_bytes());
-                self.store_rax(self.value(*dst)?);
+                self.store_rax_value(*dst)?;
             }
             Instruction::LoadLocal { dst, name } => {
                 self.load_rax(self.local(name)?);
-                self.store_rax(self.value(*dst)?);
+                self.store_rax_value(*dst)?;
             }
             Instruction::StoreLocal { name, src } => {
-                self.load_rax(self.value(*src)?);
+                self.load_value_rax(*src)?;
                 self.store_rax(self.local(name)?);
             }
             Instruction::Unary { dst, op, src } => {
-                self.load_rax(self.value(*src)?);
+                self.load_value_rax(*src)?;
                 match op {
                     IrUnary::Plus => {}
                     IrUnary::Negate => self.code.extend_from_slice(&[0x48, 0xf7, 0xd8]),
                     IrUnary::BitNot => self.code.extend_from_slice(&[0x48, 0xf7, 0xd0]),
                     IrUnary::LogicalNot => self.code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x94, 0xc0, 0x48, 0x0f, 0xb6, 0xc0]),
                 }
-                self.store_rax(self.value(*dst)?);
+                self.store_rax_value(*dst)?;
             }
             Instruction::ToBool { dst, src } => {
-                self.load_rax(self.value(*src)?);
+                self.load_value_rax(*src)?;
                 self.code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x95, 0xc0, 0x48, 0x0f, 0xb6, 0xc0]);
-                self.store_rax(self.value(*dst)?);
+                self.store_rax_value(*dst)?;
             }
             Instruction::Binary { dst, op, lhs, rhs } => {
-                self.load_rax(self.value(*lhs)?);
-                self.load_rcx(self.value(*rhs)?);
+                self.load_value_rax(*lhs)?;
+                self.load_value_rcx(*rhs)?;
                 match op {
                     IrBinary::Add => self.code.extend_from_slice(&[0x48, 0x01, 0xc8]),
                     IrBinary::Sub => self.code.extend_from_slice(&[0x48, 0x29, 0xc8]),
@@ -186,7 +234,7 @@ impl Generator {
                         self.code.extend_from_slice(&[0x0f, cc, 0xc0, 0x48, 0x0f, 0xb6, 0xc0]);
                     }
                 }
-                self.store_rax(self.value(*dst)?);
+                self.store_rax_value(*dst)?;
             }
         }
         Ok(())
@@ -198,7 +246,7 @@ impl Generator {
                 self.jump(&[0xe9], target);
             }
             Terminator::Branch { condition, if_zero, if_nonzero } => {
-                self.load_rax(self.value(condition)?);
+                self.load_value_rax(condition)?;
                 self.code.extend_from_slice(&[0x48, 0x85, 0xc0]);
                 let if_zero = self.edge_targets.get(&(self.current_block, if_zero)).copied().unwrap_or(if_zero);
                 let if_nonzero = self.edge_targets.get(&(self.current_block, if_nonzero)).copied().unwrap_or(if_nonzero);
@@ -206,7 +254,7 @@ impl Generator {
                 self.jump(&[0xe9], if_nonzero);
             }
             Terminator::Return(value) => {
-                self.load_rax(self.value(value)?);
+                self.load_value_rax(value)?;
                 // Linux x86-64 sys_exit(status), intentionally no libc dependency.
                 self.code.extend_from_slice(&[0x48, 0x89, 0xc7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05]);
             }
