@@ -19,12 +19,36 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
         next_slot += 1;
     }
     let frame = (((next_slot as usize - 1) * 8 + 15) / 16 * 16) as u32;
+    // Phi assignments are edge-specific. Redirect only those edges through
+    // tiny copy blocks so a conditional branch never executes the other edge's copies.
+    let mut edge_trampolines = Vec::<(BlockId, BlockId)>::new();
+    for block in &program.blocks {
+        let mut targets = Vec::new();
+        match block.terminator {
+            Some(Terminator::Jump(target)) => targets.push(target),
+            Some(Terminator::Branch { if_zero, if_nonzero, .. }) => {
+                targets.push(if_zero);
+                targets.push(if_nonzero);
+            }
+            _ => {}
+        }
+        for target in targets {
+            let needs_copy = program.blocks.get(target).is_some_and(|b| b.instructions.iter().any(|i|
+                matches!(i, Instruction::Phi { incoming, .. } if incoming.iter().any(|(pred, _)| *pred == block.id))));
+            if needs_copy && !edge_trampolines.contains(&(block.id, target)) {
+                edge_trampolines.push((block.id, target));
+            }
+        }
+    }
+    let edge_targets: HashMap<(BlockId, BlockId), BlockId> = edge_trampolines.iter().enumerate()
+        .map(|(i, edge)| (*edge, program.blocks.len() + i)).collect();
     let mut g = Generator {
         code: Vec::new(), local_slots, value_slots,
-        block_offsets: vec![usize::MAX; program.blocks.len()], patches: Vec::new(),
+        block_offsets: vec![usize::MAX; program.blocks.len() + edge_trampolines.len()],
+        patches: Vec::new(), edge_targets, current_block: program.entry,
     };
-    // Function prologue. Every IR value has a stable stack home, which makes this
-    // first direct backend simple and keeps control-flow joins correct without phi nodes.
+    // Function prologue. Every IR value has a stable stack home; phi nodes
+    // are lowered to copies on the incoming control-flow edges.
     g.code.extend_from_slice(&[0x55, 0x48, 0x89, 0xe5]);
     if frame != 0 {
         g.code.extend_from_slice(&[0x48, 0x81, 0xec]);
@@ -34,10 +58,28 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
         if block.id >= program.blocks.len() {
             return Err("invalid IR: block id out of range".into());
         }
+        g.current_block = block.id;
         g.block_offsets[block.id] = g.code.len();
-        for instruction in &block.instructions { g.instruction(instruction)?; }
+        for instruction in &block.instructions {
+            if !matches!(instruction, Instruction::Phi { .. }) { g.instruction(instruction)?; }
+        }
         let terminator = block.terminator.ok_or_else(|| format!("invalid IR: block {} has no terminator", block.id))?;
         g.terminator(terminator)?;
+    }
+    for (index, (predecessor, target)) in edge_trampolines.iter().copied().enumerate() {
+        let synthetic = program.blocks.len() + index;
+        g.block_offsets[synthetic] = g.code.len();
+        for instruction in &program.blocks[target].instructions {
+            if let Instruction::Phi { dst, incoming } = instruction {
+                if let Some((_, src)) = incoming.iter().find(|(pred, _)| *pred == predecessor) {
+                    let src_slot = g.value(*src)?;
+                    let dst_slot = g.value(*dst)?;
+                    g.load_rax(src_slot);
+                    g.store_rax(dst_slot);
+                }
+            }
+        }
+        g.jump(&[0xe9], target);
     }
     for (at, target) in g.patches.clone() {
         let target = *g.block_offsets.get(target).ok_or("invalid IR branch target")?;
@@ -55,6 +97,8 @@ struct Generator {
     value_slots: Vec<i32>,
     block_offsets: Vec<usize>,
     patches: Vec<(usize, BlockId)>,
+    edge_targets: HashMap<(BlockId, BlockId), BlockId>,
+    current_block: BlockId,
 }
 impl Generator {
     fn local(&self, name: &str) -> Result<i32, String> {
@@ -85,6 +129,9 @@ impl Generator {
     }
     fn instruction(&mut self, inst: &Instruction) -> Result<(), String> {
         match inst {
+            Instruction::Phi { .. } => {
+                return Err("invalid IR: phi nodes must be emitted on control-flow edges".into());
+            }
             Instruction::Const { dst, value } => {
                 self.code.extend_from_slice(&[0x48, 0xb8]);
                 self.code.extend_from_slice(&value.to_le_bytes());
@@ -146,10 +193,15 @@ impl Generator {
     }
     fn terminator(&mut self, term: Terminator) -> Result<(), String> {
         match term {
-            Terminator::Jump(target) => self.jump(&[0xe9], target),
+            Terminator::Jump(target) => {
+                let target = self.edge_targets.get(&(self.current_block, target)).copied().unwrap_or(target);
+                self.jump(&[0xe9], target);
+            }
             Terminator::Branch { condition, if_zero, if_nonzero } => {
                 self.load_rax(self.value(condition)?);
                 self.code.extend_from_slice(&[0x48, 0x85, 0xc0]);
+                let if_zero = self.edge_targets.get(&(self.current_block, if_zero)).copied().unwrap_or(if_zero);
+                let if_nonzero = self.edge_targets.get(&(self.current_block, if_nonzero)).copied().unwrap_or(if_nonzero);
                 self.jump(&[0x0f, 0x84], if_zero);
                 self.jump(&[0xe9], if_nonzero);
             }
