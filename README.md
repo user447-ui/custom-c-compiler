@@ -2,7 +2,7 @@
 
 Experimental Rust compiler with a long-term goal of C17/C++20 frontends and a native x86-64 Linux backend. It emits machine code and ELF executables directly, without GCC, Clang, LLVM, an assembler, or a linker.
 
-## Current status: 0.11.0 bootstrap
+## Current status: 0.12.0 bootstrap
 
 Implemented subset: one `int main()` or `int main(void)` function; decimal integer literals; parentheses; unary `+`, `-`, `~`, `!`; arithmetic `+`, `-`, `*`, signed `/`, `%`; bitwise `&`, `|`, `^`; comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`; short-circuit logical `&&`, `||`; local `int` declarations and assignment; nested blocks with lexical scope and shadowing; `if`/`else`; `while`; and `return`. Comparisons and logical operators produce integer 0 or 1.
 
@@ -37,7 +37,7 @@ Expected exit status: `5`.
 - `src/parser.rs`: grammar and Pratt expression parser.
 - `src/sema.rs`: lexical scopes, identifier resolution, definite-assignment diagnostics.
 - `src/ir.rs`: explicit basic blocks, virtual values, control-flow terminators, constant folding, constant-branch simplification, unreachable-block pruning, and dead-value elimination.
-- `src/codegen.rs`: direct basic-block IR to x86-64 emission, stack homes for locals and virtual values, and branch fixups.
+- `src/codegen.rs`: direct basic-block IR to x86-64 emission, stack homes for locals, linear-scan allocated registers/spills for virtual values, and branch fixups.
 - `src/elf.rs`: minimal ELF64 executable writer.
 - `tests/e2e.rs`: compile-and-run tests.
 
@@ -56,6 +56,7 @@ Expected exit status: `5`.
 - [ ] C types, pointers, arrays, structs, enums, preprocessing and multiple translation units.
 - [ ] ELF relocatable objects, symbols, relocations and linking.
 - [ ] Broader C17 conformance, then incremental C++20 features.
-- [ ] Register allocation, optimization, debug info and additional targets.
+- [x] Liveness intervals and linear-scan allocation to x86-64 registers with spill slots.
+- [ ] More advanced register allocation, debug info and additional targets.
 
-The optimizer now folds constants, simplifies branches whose conditions are known, removes unreachable blocks, and iteratively deletes unused pure computations while preserving stores and other required effects. The IR now has explicit SSA-style phi nodes for short-circuit expression results. The backend lowers phi inputs to edge-specific stack copies; local variables are promoted to SSA with phi nodes at control-flow joins; the backend still assigns stack homes to virtual values, so register allocation remains future work. Full C17/C++20 compatibility is a long-term goal, not a current capability.
+The optimizer now folds constants, simplifies branches whose conditions are known, removes unreachable blocks, and iteratively deletes unused pure computations while preserving stores and other required effects. The IR now has explicit SSA-style phi nodes for short-circuit expression results. The backend lowers phi inputs to edge-specific stack copies; local variables are promoted to SSA with phi nodes at control-flow joins; the backend assigns virtual values to RBX/R12–R15 when possible and spills excess live ranges to stack slots. More advanced allocation remains future work. Full C17/C++20 compatibility is a long-term goal, not a current capability.
