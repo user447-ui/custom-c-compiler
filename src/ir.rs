@@ -115,32 +115,35 @@ fn opt_expr(e: IrExpr) -> IrExpr {
         IrExpr::Const(_) | IrExpr::Local(_) => e,
         IrExpr::Unary { op, value } => {
             let value = opt_expr(*value);
-            if let IrExpr::Const(n) = value {
-                let folded = match op {
-                    IrUnary::Plus => Some(n),
-                    IrUnary::Negate => n.checked_neg(),
-                    IrUnary::BitNot => Some(!n),
-                    IrUnary::LogicalNot => Some(i64::from(n == 0)),
-                };
-                folded.map(IrExpr::Const).unwrap_or(IrExpr::Unary { op, value: Box::new(IrExpr::Const(n)) })
-            } else { IrExpr::Unary { op, value: Box::new(value) } }
+            match value {
+                IrExpr::Const(n) => {
+                    let folded = match op {
+                        IrUnary::Plus => Some(n), IrUnary::Negate => n.checked_neg(),
+                        IrUnary::BitNot => Some(!n), IrUnary::LogicalNot => Some(i64::from(n == 0)),
+                    };
+                    folded.map(IrExpr::Const).unwrap_or(IrExpr::Unary { op, value: Box::new(IrExpr::Const(n)) })
+                }
+                value => IrExpr::Unary { op, value: Box::new(value) },
+            }
         }
         IrExpr::Binary { op, lhs, rhs } => {
             let lhs = opt_expr(*lhs);
-            // Preserve runtime short-circuiting, and discard an unreachable RHS when
-            // the left constant decides the result.
-            if let IrExpr::Const(n) = lhs {
-                if op == IrBinary::LogicalAnd && n == 0 { return IrExpr::Const(0); }
-                if op == IrBinary::LogicalOr && n != 0 { return IrExpr::Const(1); }
-                let rhs = opt_expr(*rhs);
-                if let IrExpr::Const(r) = rhs {
-                    if let Some(v) = fold_binary(op, n, r) { return IrExpr::Const(v); }
-                    return IrExpr::Binary { op, lhs: Box::new(IrExpr::Const(n)), rhs: Box::new(IrExpr::Const(r)) };
+            match lhs {
+                IrExpr::Const(n) => {
+                    if op == IrBinary::LogicalAnd && n == 0 { return IrExpr::Const(0); }
+                    if op == IrBinary::LogicalOr && n != 0 { return IrExpr::Const(1); }
+                    let rhs = opt_expr(*rhs);
+                    match rhs {
+                        IrExpr::Const(r) => fold_binary(op, n, r).map(IrExpr::Const).unwrap_or(
+                            IrExpr::Binary { op, lhs: Box::new(IrExpr::Const(n)), rhs: Box::new(IrExpr::Const(r)) }),
+                        rhs => IrExpr::Binary { op, lhs: Box::new(IrExpr::Const(n)), rhs: Box::new(rhs) },
+                    }
                 }
-                return IrExpr::Binary { op, lhs: Box::new(IrExpr::Const(n)), rhs: Box::new(rhs) };
+                lhs => {
+                    let rhs = opt_expr(*rhs);
+                    IrExpr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }
+                }
             }
-            let rhs = opt_expr(*rhs);
-            IrExpr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }
         }
     }
 }
