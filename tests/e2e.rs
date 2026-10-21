@@ -7,6 +7,8 @@ fn compiles_and_runs_expressions_and_statements(){
  ("return 2+3*4;",14),("return (20-8)/3;",4),("return 17%5;",2),
  ("int x=10;x=x+7;return x;",17),("int x=0;if(1)x=7;else x=8;return x;",7),
  ("int x=0;if(0)x=7;else x=8;return x;",8),("int x=0;while(x-5)x=x+1;return x;",5),
+ ("int x=1;if(x<2)x=x+3;else x=x+4;return x;",4),
+ ("int x=0;while(x<5)x=x+1;return x;",5),
  ("int x=3;{int y=4;x=x+y;}return x;",7),("int x=1;int y=2;while(y-6){x=x*2;y=y+1;}return x;",16),
  ("if(2<3)return 11;return 22;",11),("if(3<=3)return 12;return 22;",12),
  ("if(4>3)return 13;return 22;",13),("if(4>=5)return 22;return 14;",14),
