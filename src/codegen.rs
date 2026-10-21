@@ -20,16 +20,15 @@ pub fn generate(p: &Program) -> Result<Vec<u8>, String> {
 }
 fn collect(ss:&[Stmt],v:&mut Vec<String>)->Result<(),String>{
     for s in ss { match s {
-        Stmt::Declaration{name,..}=>{if v.contains(name){return Err(format!("duplicate local variable '{name}' (shadowing not supported)"));}v.push(name.clone());},
+        Stmt::Declaration{name,..}=>{if v.contains(name){return Err(format!("duplicate backend variable '{name}'"));}v.push(name.clone());},
         Stmt::Block(b)=>collect(b,v)?,
         Stmt::If{then_branch,else_branch,..}=>{collect_one(then_branch,v)?;if let Some(x)=else_branch{collect_one(x,v)?}},
-        Stmt::While{body,..}=>collect_one(body,v)?,
-        _=>{},
+        Stmt::While{body,..}=>collect_one(body,v)?, _=>{},
     }} Ok(())
 }
 fn collect_one(s:&Stmt,v:&mut Vec<String>)->Result<(),String>{match s{
     Stmt::Block(b)=>collect(b,v),
-    Stmt::Declaration{name,..}=>{if v.contains(name){return Err(format!("duplicate local variable '{name}' (shadowing not supported)"));}v.push(name.clone());Ok(())},
+    Stmt::Declaration{name,..}=>{if v.contains(name){return Err(format!("duplicate backend variable '{name}'"));}v.push(name.clone());Ok(())},
     Stmt::If{then_branch,else_branch,..}=>{collect_one(then_branch,v)?;if let Some(x)=else_branch{collect_one(x,v)?}Ok(())},
     Stmt::While{body,..}=>collect_one(body,v),_=>Ok(())
 }}
@@ -38,7 +37,8 @@ impl Gen {
     fn label(&mut self)->usize{let i=self.labels.len();self.labels.push(usize::MAX);i}
     fn mark(&mut self,l:usize){self.labels[l]=self.c.len();}
     fn jump(&mut self,cond:bool,l:usize){if cond{self.c.extend_from_slice(&[0x0f,0x84]);}else{self.c.push(0xe9);}let at=self.c.len();self.c.extend_from_slice(&[0;4]);self.patches.push((at,l));}
-    fn slot(&self,n:&str)->Result<i32,String>{self.slots.get(n).copied().ok_or_else(||format!("use of undeclared variable '{n}'"))}
+    fn jump_nonzero(&mut self,l:usize){self.c.extend_from_slice(&[0x0f,0x85]);let at=self.c.len();self.c.extend_from_slice(&[0;4]);self.patches.push((at,l));}
+    fn slot(&self,n:&str)->Result<i32,String>{self.slots.get(n).copied().ok_or_else(||format!("internal error: unresolved variable '{n}'"))}
     fn stmt(&mut self,s:&Stmt)->Result<(),String>{match s{
         Stmt::Declaration{name,initializer}=>if let Some(e)=initializer{self.expr(e)?;let d=self.slot(name)?;self.c.extend_from_slice(&[0x48,0x89,0x85]);self.c.extend_from_slice(&(-d).to_le_bytes());},
         Stmt::Assignment{name,value}=>{self.expr(value)?;let d=self.slot(name)?;self.c.extend_from_slice(&[0x48,0x89,0x85]);self.c.extend_from_slice(&(-d).to_le_bytes());},
@@ -52,6 +52,8 @@ impl Gen {
         Expr::Variable(n)=>{let d=self.slot(n)?;self.c.extend_from_slice(&[0x48,0x8b,0x85]);self.c.extend_from_slice(&(-d).to_le_bytes());},
         Expr::Unary{op,expr}=>{self.expr(expr)?;match op{UnaryOp::Plus=>{},UnaryOp::Minus=>self.c.extend_from_slice(&[0x48,0xf7,0xd8]),UnaryOp::BitNot=>self.c.extend_from_slice(&[0x48,0xf7,0xd0]),UnaryOp::LogicalNot=>self.c.extend_from_slice(&[0x48,0x85,0xc0,0x0f,0x94,0xc0,0x48,0x0f,0xb6,0xc0])}},
         Expr::Binary{op,left,right}=>{
+            if *op==BinaryOp::LogicalAnd { self.logical_and(left,right)?; return Ok(()); }
+            if *op==BinaryOp::LogicalOr { self.logical_or(left,right)?; return Ok(()); }
             self.expr(left)?;self.c.push(0x50);self.expr(right)?;self.c.push(0x59);
             match op{
                 BinaryOp::Add=>self.c.extend_from_slice(&[0x48,0x01,0xc8]),
@@ -66,12 +68,22 @@ impl Gen {
                     let cc=match op{BinaryOp::Equal=>0x94,BinaryOp::NotEqual=>0x95,BinaryOp::Less=>0x9c,BinaryOp::LessEqual=>0x9e,BinaryOp::Greater=>0x9f,BinaryOp::GreaterEqual=>0x9d,_=>unreachable!()};
                     self.c.extend_from_slice(&[0x0f,cc,0xc0,0x48,0x0f,0xb6,0xc0]);
                 },
-                BinaryOp::LogicalAnd|BinaryOp::LogicalOr=>{
-                    self.c.extend_from_slice(&[0x48,0x85,0xc9,0x0f,0x95,0xc1,0x48,0x85,0xc0,0x0f,0x95,0xc0]);
-                    if *op==BinaryOp::LogicalAnd{self.c.extend_from_slice(&[0x20,0xc8]);}else{self.c.extend_from_slice(&[0x08,0xc8]);}
-                    self.c.extend_from_slice(&[0x48,0x0f,0xb6,0xc0]);
-                },
+                BinaryOp::LogicalAnd|BinaryOp::LogicalOr=>unreachable!(),
             }
         },
     } Ok(())}
+    fn logical_and(&mut self,l:&Expr,r:&Expr)->Result<(),String>{
+        let no=self.label();let end=self.label();
+        self.expr(l)?;self.c.extend_from_slice(&[0x48,0x85,0xc0]);self.jump(true,no);
+        self.expr(r)?;self.c.extend_from_slice(&[0x48,0x85,0xc0]);self.jump(true,no);
+        self.c.extend_from_slice(&[0x48,0xb8,1,0,0,0,0,0,0,0]);self.jump(false,end);
+        self.mark(no);self.c.extend_from_slice(&[0x48,0xb8,0,0,0,0,0,0,0,0]);self.mark(end);Ok(())
+    }
+    fn logical_or(&mut self,l:&Expr,r:&Expr)->Result<(),String>{
+        let yes=self.label();let end=self.label();
+        self.expr(l)?;self.c.extend_from_slice(&[0x48,0x85,0xc0]);self.jump_nonzero(yes);
+        self.expr(r)?;self.c.extend_from_slice(&[0x48,0x85,0xc0]);self.jump_nonzero(yes);
+        self.c.extend_from_slice(&[0x48,0xb8,0,0,0,0,0,0,0,0]);self.jump(false,end);
+        self.mark(yes);self.c.extend_from_slice(&[0x48,0xb8,1,0,0,0,0,0,0,0]);self.mark(end);Ok(())
+    }
 }
