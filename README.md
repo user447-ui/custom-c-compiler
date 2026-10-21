@@ -32,7 +32,8 @@ The program exits with status 14. This is a native Linux process exit status, no
 ## Source layout
 
 - `src/lexer.rs`: tokens and source offsets; skips whitespace and C comments.
-- `src/parser.rs`: bootstrap grammar, AST expression types and precedence parsing.
+- `src/ast.rs`: shared expression and program AST types, independent of parser implementation.
+- `src/parser.rs`: bootstrap grammar and precedence parsing.
 - `src/codegen.rs`: x86-64 instruction emission for integer expressions.
 - `src/elf.rs`: minimal ELF64 executable serialization.
 - `src/main.rs`: command-line driver and pipeline orchestration.
