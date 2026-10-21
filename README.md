@@ -1,46 +1,64 @@
 # custom-c-compiler
 
-Experimental C17/C++20 compiler implemented in Rust. The project aims to share frontend infrastructure and use a fully native x86-64 backend that emits Linux ELF binaries without invoking GCC, Clang, an assembler, or a linker for the generated program.
+An experimental compiler written in Rust, targeting C17 and C++20 with a shared frontend/IR architecture and a native x86-64 Linux backend. The backend emits machine code and serializes ELF executables directly; the generated program is not passed through GCC, Clang, LLVM, an assembler, or a linker.
 
-## Stage 1
+## Current status: 0.2.0 bootstrap
 
-A first vertical slice accepts a tiny C subset:
+The prototype currently accepts a narrow subset of C:
 
-    int main(void) { return 42; }
+```c
+int main(void) {
+    return 2 + 3 * 4;
+}
+```
 
-It writes a minimal static x86-64 Linux ELF executable directly. The generated program exits through the Linux exit syscall. This is a bootstrap milestone, not full C17 support.
+Supported expressions: decimal integer literals, parentheses, unary `+`, unary `-`, bitwise complement `~`, binary `+`, `-`, `*`, signed `/`, signed `%`, bitwise `&`, `|`, and `^`. Operator precedence is parsed with a Pratt parser. Only a single `int main(...)` function containing one return statement is accepted. Variables, declarations, preprocessing, strings, floating point, and C++ syntax are not implemented yet.
 
-## Build
+## Build and run
 
-Requires Rust stable; generated executables run on Linux x86-64.
+Requires stable Rust. Generated binaries target Linux x86-64.
 
-    cargo build --release
-    printf 'int main(void) { return 42; }\n' > test.c
-    ./target/release/ccc -o test test.c
-    ./test
-    echo $?
+```sh
+cargo test --all-targets
+cargo build --release
+printf 'int main(void) { return 2 + 3 * 4; }\n' > test.c
+./target/release/ccc -o test test.c
+./test
+echo $?
+```
 
-Expected exit status: 42.
+The program exits with status 14. This is a native Linux process exit status, not text printed to stdout.
 
-## Architecture
+## Source layout
 
-- Lexer and parser: tokens, source spans, C/C++ grammar modes.
-- Semantic analysis: declarations, scopes, name lookup, type checking.
-- Shared typed IR: language-neutral representation, control-flow graph, later SSA.
-- Optimizer: constant folding, dead-code elimination, inlining.
-- x86-64 backend: instruction selection, register allocation, ABI lowering.
-- ELF writer: executable first, then relocatable objects and relocations.
-- Driver: CLI, diagnostics, include paths and target options.
+- `src/lexer.rs`: tokens and source offsets; skips whitespace and C comments.
+- `src/parser.rs`: bootstrap grammar, AST expression types and precedence parsing.
+- `src/codegen.rs`: x86-64 instruction emission for integer expressions.
+- `src/elf.rs`: minimal ELF64 executable serialization.
+- `src/main.rs`: command-line driver and pipeline orchestration.
+- `tests/e2e.rs`: compiles a C input and runs the resulting ELF binary.
+
+## Architecture direction
+
+The current files form a small vertical slice. The intended architecture separates:
+
+1. **Driver and diagnostics** — CLI, source files, options and source locations.
+2. **Frontend** — reusable lexer, separate C and C++ grammar modes, AST and semantic analysis.
+3. **Typed IR** — target-independent typed expressions, statements and control-flow graph.
+4. **Optimizer** — constant folding, dead-code elimination, later SSA-based passes.
+5. **Target backend** — x86-64 instruction selection, register allocation, stack frames and ABI lowering.
+6. **Object writer** — ELF relocatable objects, symbols and relocations; eventually external linking.
+7. **Conformance suites** — language feature tests, negative tests and differential tests against reference compilers.
 
 ## Milestones
 
-1. Bootstrap parser and direct ELF emission.
-2. Expressions, precedence and arithmetic machine code.
-3. Locals, branches, loops, stack frames and function calls.
-4. C frontend: types, pointers, arrays, structs, preprocessing and translation units.
-5. ELF objects, relocations and external linking.
-6. C17 conformance suite.
-7. C++20 features: classes, references, overload resolution, templates, exceptions and standard library compatibility.
-8. Optimization, debug information, AArch64 and Windows targets.
+- [x] Stage 1: minimal parser and direct ELF executable emission.
+- [x] Stage 2 bootstrap: integer expressions, operator precedence, unary operators and arithmetic/bitwise machine code.
+- [ ] Stage 3: local variables, assignment, blocks, conditionals, loops and stack frames.
+- [ ] Stage 4: proper C types, pointers, arrays, structs, enums, preprocessing and multiple translation units.
+- [ ] Stage 5: ELF object files, relocations, symbols and linking against system libraries.
+- [ ] Stage 6: broader C17 compatibility and conformance testing.
+- [ ] Stage 7: C++20 frontend features, incrementally including classes, references, overloads, templates and exceptions.
+- [ ] Stage 8: optimization, debug info, AArch64 and other object formats/targets.
 
-No LLVM dependency is planned in the code-generation path. Full C17/C++20 compatibility is a long-term goal, not a current claim.
+Full C17/C++20 compatibility is a long-term goal, not a claim about the current prototype.
