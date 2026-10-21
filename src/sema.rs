@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use crate::ast::{BinaryOp, Expr, Program, Stmt};
+use crate::ast::{Expr, Program, Stmt};
 
 /// Resolve identifiers and validate declarations while preserving lexical scope,
 /// then reject reads of locals that are not definitely initialized.
@@ -123,12 +123,10 @@ impl Flow {
                 }
             }
             Expr::Unary { expr, .. } => self.expr(expr),
-            Expr::Binary { op, left, right } => {
+            Expr::Binary { left, right, .. } => {
                 self.expr(left)?;
-                // For logical operators the RHS may not execute, but this language
-                // has no assignment expressions; checking it is conservative and
-                // catches reads that could occur when the RHS is evaluated.
-                let _ = op == &BinaryOp::LogicalAnd || op == &BinaryOp::LogicalOr;
+                // This subset has no assignment expressions, so checking both operands
+                // is conservative and catches any potentially evaluated uninitialized read.
                 self.expr(right)
             }
         }
