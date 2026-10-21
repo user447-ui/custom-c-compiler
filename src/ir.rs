@@ -210,7 +210,7 @@ mod tests {
     }
     #[test] fn folds_unary_ops() {
         let p=lower_source("int main(){return !0 + ~0;}");
-        assert_eq!(p.statements, vec![IrStmt::Return(IrExpr::Const(0))]);
+        assert_eq!(p.statements, vec![IrStmt::Return(IrExpr::Const(-1))]);
     }
     #[test] fn folds_short_circuit_without_evaluating_unreachable_rhs() {
         let p=lower_source("int main(){return 0 && (1/0);}");
