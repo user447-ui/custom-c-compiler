@@ -1,18 +1,38 @@
 use crate::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
 
-/// Target-independent, typed-by-construction integer IR for the current C subset.
-/// Variable names have already been resolved by semantic analysis.
-#[derive(Debug, Clone, PartialEq)]
-pub struct IrProgram { pub statements: Vec<IrStmt> }
+pub type ValueId = usize;
+pub type BlockId = usize;
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum IrStmt {
-    Declare { name: String, initializer: Option<IrExpr> },
-    Store { name: String, value: IrExpr },
-    Return(IrExpr),
-    Block(Vec<IrStmt>),
-    If { condition: IrExpr, then_branch: Box<IrStmt>, else_branch: Option<Box<IrStmt>> },
-    While { condition: IrExpr, body: Box<IrStmt> },
+pub struct IrProgram {
+    pub locals: Vec<String>,
+    pub value_count: usize,
+    pub blocks: Vec<BasicBlock>,
+    pub entry: BlockId,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct BasicBlock {
+    pub id: BlockId,
+    pub instructions: Vec<Instruction>,
+    pub terminator: Option<Terminator>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Instruction {
+    Const { dst: ValueId, value: i64 },
+    LoadLocal { dst: ValueId, name: String },
+    StoreLocal { name: String, src: ValueId },
+    Unary { dst: ValueId, op: IrUnary, src: ValueId },
+    Binary { dst: ValueId, op: IrBinary, lhs: ValueId, rhs: ValueId },
+    ToBool { dst: ValueId, src: ValueId },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Terminator {
+    Jump(BlockId),
+    Branch { condition: ValueId, if_zero: BlockId, if_nonzero: BlockId },
+    Return(ValueId),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -22,177 +42,186 @@ pub enum IrUnary { Plus, Negate, BitNot, LogicalNot }
 pub enum IrBinary {
     Add, Sub, Mul, Div, Rem, BitAnd, BitOr, BitXor,
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
-    LogicalAnd, LogicalOr,
-}
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum IrExpr {
-    Const(i64),
-    Local(String),
-    Unary { op: IrUnary, value: Box<IrExpr> },
-    Binary { op: IrBinary, lhs: Box<IrExpr>, rhs: Box<IrExpr> },
 }
 
 pub fn lower(program: &Program) -> IrProgram {
-    IrProgram { statements: program.statements.iter().map(lower_stmt).collect() }
-}
-
-pub fn optimize(program: IrProgram) -> IrProgram {
-    IrProgram { statements: program.statements.into_iter().map(opt_stmt).collect() }
-}
-
-impl IrProgram {
-    /// Temporary bridge for the existing native backend while the backend is migrated
-    /// to consume IR instructions directly in a later milestone.
-    pub fn to_ast(&self) -> Program {
-        Program { statements: self.statements.iter().map(stmt_to_ast).collect() }
+    let mut builder = Builder { locals: Vec::new(), value_count: 0, blocks: Vec::new(), current: 0 };
+    builder.new_block();
+    for statement in &program.statements { builder.statement(statement); }
+    if builder.blocks[builder.current].terminator.is_none() {
+        let zero = builder.value();
+        builder.emit(Instruction::Const { dst: zero, value: 0 });
+        builder.terminate(Terminator::Return(zero));
     }
+    IrProgram { locals: builder.locals, value_count: builder.value_count, blocks: builder.blocks, entry: 0 }
 }
 
-fn lower_stmt(s: &Stmt) -> IrStmt {
-    match s {
-        Stmt::Declaration { name, initializer } => IrStmt::Declare {
-            name: name.clone(), initializer: initializer.as_ref().map(lower_expr),
-        },
-        Stmt::Assignment { name, value } => IrStmt::Store { name: name.clone(), value: lower_expr(value) },
-        Stmt::Return(e) => IrStmt::Return(lower_expr(e)),
-        Stmt::Block(ss) => IrStmt::Block(ss.iter().map(lower_stmt).collect()),
-        Stmt::If { condition, then_branch, else_branch } => IrStmt::If {
-            condition: lower_expr(condition), then_branch: Box::new(lower_stmt(then_branch)),
-            else_branch: else_branch.as_ref().map(|s| Box::new(lower_stmt(s))),
-        },
-        Stmt::While { condition, body } => IrStmt::While {
-            condition: lower_expr(condition), body: Box::new(lower_stmt(body)),
-        },
-    }
-}
-
-fn lower_expr(e: &Expr) -> IrExpr {
-    match e {
-        Expr::Number(n) => IrExpr::Const(*n),
-        Expr::Variable(n) => IrExpr::Local(n.clone()),
-        Expr::Unary { op, expr } => IrExpr::Unary {
-            op: match op { UnaryOp::Plus=>IrUnary::Plus, UnaryOp::Minus=>IrUnary::Negate,
-                UnaryOp::BitNot=>IrUnary::BitNot, UnaryOp::LogicalNot=>IrUnary::LogicalNot },
-            value: Box::new(lower_expr(expr)),
-        },
-        Expr::Binary { op, left, right } => IrExpr::Binary {
-            op: match op {
-                BinaryOp::Add=>IrBinary::Add, BinaryOp::Sub=>IrBinary::Sub, BinaryOp::Mul=>IrBinary::Mul,
-                BinaryOp::Div=>IrBinary::Div, BinaryOp::Rem=>IrBinary::Rem,
-                BinaryOp::BitAnd=>IrBinary::BitAnd, BinaryOp::BitOr=>IrBinary::BitOr, BinaryOp::BitXor=>IrBinary::BitXor,
-                BinaryOp::Equal=>IrBinary::Equal, BinaryOp::NotEqual=>IrBinary::NotEqual,
-                BinaryOp::Less=>IrBinary::Less, BinaryOp::LessEqual=>IrBinary::LessEqual,
-                BinaryOp::Greater=>IrBinary::Greater, BinaryOp::GreaterEqual=>IrBinary::GreaterEqual,
-                BinaryOp::LogicalAnd=>IrBinary::LogicalAnd, BinaryOp::LogicalOr=>IrBinary::LogicalOr,
-            },
-            lhs: Box::new(lower_expr(left)), rhs: Box::new(lower_expr(right)),
-        },
-    }
-}
-
-fn opt_stmt(s: IrStmt) -> IrStmt {
-    match s {
-        IrStmt::Declare { name, initializer } => IrStmt::Declare { name, initializer: initializer.map(opt_expr) },
-        IrStmt::Store { name, value } => IrStmt::Store { name, value: opt_expr(value) },
-        IrStmt::Return(e) => IrStmt::Return(opt_expr(e)),
-        IrStmt::Block(ss) => IrStmt::Block(ss.into_iter().map(opt_stmt).collect()),
-        IrStmt::If { condition, then_branch, else_branch } => {
-            let condition = opt_expr(condition);
-            let then_branch = Box::new(opt_stmt(*then_branch));
-            let else_branch = else_branch.map(|s| Box::new(opt_stmt(*s)));
-            // Keep control-flow structure intact: only expressions are folded here.
-            IrStmt::If { condition, then_branch, else_branch }
-        }
-        IrStmt::While { condition, body } => IrStmt::While {
-            condition: opt_expr(condition), body: Box::new(opt_stmt(*body)),
-        },
-    }
-}
-
-fn opt_expr(e: IrExpr) -> IrExpr {
-    match e {
-        IrExpr::Const(_) | IrExpr::Local(_) => e,
-        IrExpr::Unary { op, value } => {
-            let value = opt_expr(*value);
-            match value {
-                IrExpr::Const(n) => {
-                    let folded = match op {
+/// Fold constants inside each basic block. Control-flow edges and short-circuit
+/// branches are explicit, so this pass never evaluates an untaken branch.
+pub fn optimize(mut program: IrProgram) -> IrProgram {
+    for block in &mut program.blocks {
+        let mut constants = std::collections::HashMap::<ValueId, i64>::new();
+        for inst in &mut block.instructions {
+            match inst.clone() {
+                Instruction::Const { dst, value } => { constants.insert(dst, value); }
+                Instruction::Unary { dst, op, src } => {
+                    let folded = constants.get(&src).copied().and_then(|n| match op {
                         IrUnary::Plus => Some(n), IrUnary::Negate => n.checked_neg(),
                         IrUnary::BitNot => Some(!n), IrUnary::LogicalNot => Some(i64::from(n == 0)),
-                    };
-                    folded.map(IrExpr::Const).unwrap_or(IrExpr::Unary { op, value: Box::new(IrExpr::Const(n)) })
+                    });
+                    if let Some(value) = folded {
+                        *inst = Instruction::Const { dst, value }; constants.insert(dst, value);
+                    } else { constants.remove(&dst); }
                 }
-                value => IrExpr::Unary { op, value: Box::new(value) },
-            }
-        }
-        IrExpr::Binary { op, lhs, rhs } => {
-            let lhs = opt_expr(*lhs);
-            match lhs {
-                IrExpr::Const(n) => {
-                    if op == IrBinary::LogicalAnd && n == 0 { return IrExpr::Const(0); }
-                    if op == IrBinary::LogicalOr && n != 0 { return IrExpr::Const(1); }
-                    let rhs = opt_expr(*rhs);
-                    match rhs {
-                        IrExpr::Const(r) => fold_binary(op, n, r).map(IrExpr::Const).unwrap_or(
-                            IrExpr::Binary { op, lhs: Box::new(IrExpr::Const(n)), rhs: Box::new(IrExpr::Const(r)) }),
-                        rhs => IrExpr::Binary { op, lhs: Box::new(IrExpr::Const(n)), rhs: Box::new(rhs) },
-                    }
+                Instruction::Binary { dst, op, lhs, rhs } => {
+                    let folded = constants.get(&lhs).copied().zip(constants.get(&rhs).copied())
+                        .and_then(|(a,b)| fold_binary(op,a,b));
+                    if let Some(value) = folded {
+                        *inst = Instruction::Const { dst, value }; constants.insert(dst, value);
+                    } else { constants.remove(&dst); }
                 }
-                lhs => {
-                    let rhs = opt_expr(*rhs);
-                    IrExpr::Binary { op, lhs: Box::new(lhs), rhs: Box::new(rhs) }
+                Instruction::ToBool { dst, src } => {
+                    if let Some(n) = constants.get(&src).copied() {
+                        let value = i64::from(n != 0);
+                        *inst = Instruction::Const { dst, value }; constants.insert(dst, value);
+                    } else { constants.remove(&dst); }
                 }
+                Instruction::LoadLocal { dst, .. } => { constants.remove(&dst); }
+                Instruction::StoreLocal { .. } => {}
             }
         }
     }
+    program
 }
 
 fn fold_binary(op: IrBinary, a: i64, b: i64) -> Option<i64> {
     Some(match op {
-        IrBinary::Add => a.checked_add(b)?,
-        IrBinary::Sub => a.checked_sub(b)?,
-        IrBinary::Mul => a.checked_mul(b)?,
-        IrBinary::Div => a.checked_div(b)?,
-        IrBinary::Rem => a.checked_rem(b)?,
-        IrBinary::BitAnd => a & b, IrBinary::BitOr => a | b, IrBinary::BitXor => a ^ b,
+        IrBinary::Add => a.checked_add(b)?, IrBinary::Sub => a.checked_sub(b)?,
+        IrBinary::Mul => a.checked_mul(b)?, IrBinary::Div => a.checked_div(b)?,
+        IrBinary::Rem => a.checked_rem(b)?, IrBinary::BitAnd => a & b,
+        IrBinary::BitOr => a | b, IrBinary::BitXor => a ^ b,
         IrBinary::Equal => i64::from(a == b), IrBinary::NotEqual => i64::from(a != b),
         IrBinary::Less => i64::from(a < b), IrBinary::LessEqual => i64::from(a <= b),
         IrBinary::Greater => i64::from(a > b), IrBinary::GreaterEqual => i64::from(a >= b),
-        IrBinary::LogicalAnd => i64::from(a != 0 && b != 0),
-        IrBinary::LogicalOr => i64::from(a != 0 || b != 0),
     })
 }
 
-fn stmt_to_ast(s: &IrStmt) -> Stmt {
-    match s {
-        IrStmt::Declare { name, initializer } => Stmt::Declaration { name: name.clone(), initializer: initializer.as_ref().map(expr_to_ast) },
-        IrStmt::Store { name, value } => Stmt::Assignment { name: name.clone(), value: expr_to_ast(value) },
-        IrStmt::Return(e) => Stmt::Return(expr_to_ast(e)),
-        IrStmt::Block(ss) => Stmt::Block(ss.iter().map(stmt_to_ast).collect()),
-        IrStmt::If { condition, then_branch, else_branch } => Stmt::If {
-            condition: expr_to_ast(condition), then_branch: Box::new(stmt_to_ast(then_branch)),
-            else_branch: else_branch.as_ref().map(|s| Box::new(stmt_to_ast(s))),
-        },
-        IrStmt::While { condition, body } => Stmt::While { condition: expr_to_ast(condition), body: Box::new(stmt_to_ast(body)) },
-    }
+struct Builder {
+    locals: Vec<String>,
+    value_count: usize,
+    blocks: Vec<BasicBlock>,
+    current: BlockId,
 }
-fn expr_to_ast(e: &IrExpr) -> Expr {
-    match e {
-        IrExpr::Const(n) => Expr::Number(*n), IrExpr::Local(n) => Expr::Variable(n.clone()),
-        IrExpr::Unary { op, value } => Expr::Unary { op: match op {
-            IrUnary::Plus=>UnaryOp::Plus, IrUnary::Negate=>UnaryOp::Minus,
-            IrUnary::BitNot=>UnaryOp::BitNot, IrUnary::LogicalNot=>UnaryOp::LogicalNot,
-        }, expr: Box::new(expr_to_ast(value)) },
-        IrExpr::Binary { op, lhs, rhs } => Expr::Binary { op: match op {
-            IrBinary::Add=>BinaryOp::Add, IrBinary::Sub=>BinaryOp::Sub, IrBinary::Mul=>BinaryOp::Mul,
-            IrBinary::Div=>BinaryOp::Div, IrBinary::Rem=>BinaryOp::Rem,
-            IrBinary::BitAnd=>BinaryOp::BitAnd, IrBinary::BitOr=>BinaryOp::BitOr, IrBinary::BitXor=>BinaryOp::BitXor,
-            IrBinary::Equal=>BinaryOp::Equal, IrBinary::NotEqual=>BinaryOp::NotEqual,
-            IrBinary::Less=>BinaryOp::Less, IrBinary::LessEqual=>BinaryOp::LessEqual,
-            IrBinary::Greater=>BinaryOp::Greater, IrBinary::GreaterEqual=>BinaryOp::GreaterEqual,
-            IrBinary::LogicalAnd=>BinaryOp::LogicalAnd, IrBinary::LogicalOr=>BinaryOp::LogicalOr,
-        }, left: Box::new(expr_to_ast(lhs)), right: Box::new(expr_to_ast(rhs)) },
+impl Builder {
+    fn new_block(&mut self) -> BlockId {
+        let id = self.blocks.len();
+        self.blocks.push(BasicBlock { id, instructions: Vec::new(), terminator: None });
+        id
+    }
+    fn value(&mut self) -> ValueId { let id = self.value_count; self.value_count += 1; id }
+    fn emit(&mut self, instruction: Instruction) { self.blocks[self.current].instructions.push(instruction); }
+    fn terminate(&mut self, terminator: Terminator) {
+        debug_assert!(self.blocks[self.current].terminator.is_none());
+        self.blocks[self.current].terminator = Some(terminator);
+    }
+    fn open_block(&mut self) {
+        if self.blocks[self.current].terminator.is_some() { self.current = self.new_block(); }
+    }
+    fn jump_if_open(&mut self, target: BlockId) {
+        if self.blocks[self.current].terminator.is_none() { self.terminate(Terminator::Jump(target)); }
+    }
+    fn constant(&mut self, value: i64) -> ValueId {
+        let dst = self.value(); self.emit(Instruction::Const { dst, value }); dst
+    }
+    fn statement(&mut self, s: &Stmt) {
+        self.open_block();
+        match s {
+            Stmt::Declaration { name, initializer } => {
+                if !self.locals.contains(name) { self.locals.push(name.clone()); }
+                if let Some(e) = initializer {
+                    let src = self.expression(e);
+                    self.emit(Instruction::StoreLocal { name: name.clone(), src });
+                }
+            }
+            Stmt::Assignment { name, value } => {
+                let src = self.expression(value);
+                self.emit(Instruction::StoreLocal { name: name.clone(), src });
+            }
+            Stmt::Return(e) => {
+                let value = self.expression(e); self.terminate(Terminator::Return(value));
+            }
+            Stmt::Block(body) => for statement in body { self.statement(statement); },
+            Stmt::If { condition, then_branch, else_branch } => {
+                let condition = self.expression(condition);
+                let then_block = self.new_block();
+                let else_block = self.new_block();
+                let merge_block = self.new_block();
+                self.terminate(Terminator::Branch { condition, if_zero: else_block, if_nonzero: then_block });
+                self.current = then_block; self.statement(then_branch); self.jump_if_open(merge_block);
+                self.current = else_block;
+                if let Some(other) = else_branch { self.statement(other); }
+                self.jump_if_open(merge_block);
+                self.current = merge_block;
+            }
+            Stmt::While { condition, body } => {
+                let cond_block = self.new_block();
+                let body_block = self.new_block();
+                let exit_block = self.new_block();
+                self.terminate(Terminator::Jump(cond_block));
+                self.current = cond_block;
+                let condition = self.expression(condition);
+                self.terminate(Terminator::Branch { condition, if_zero: exit_block, if_nonzero: body_block });
+                self.current = body_block; self.statement(body); self.jump_if_open(cond_block);
+                self.current = exit_block;
+            }
+        }
+    }
+    fn expression(&mut self, e: &Expr) -> ValueId {
+        match e {
+            Expr::Number(value) => self.constant(*value),
+            Expr::Variable(name) => {
+                let dst = self.value(); self.emit(Instruction::LoadLocal { dst, name: name.clone() }); dst
+            }
+            Expr::Unary { op, expr } => {
+                let src = self.expression(expr); let dst = self.value();
+                let op = match op {
+                    UnaryOp::Plus => IrUnary::Plus, UnaryOp::Minus => IrUnary::Negate,
+                    UnaryOp::BitNot => IrUnary::BitNot, UnaryOp::LogicalNot => IrUnary::LogicalNot,
+                };
+                self.emit(Instruction::Unary { dst, op, src }); dst
+            }
+            Expr::Binary { op: BinaryOp::LogicalAnd, left, right } => self.logical(left, right, true),
+            Expr::Binary { op: BinaryOp::LogicalOr, left, right } => self.logical(left, right, false),
+            Expr::Binary { op, left, right } => {
+                let lhs = self.expression(left); let rhs = self.expression(right); let dst = self.value();
+                let op = match op {
+                    BinaryOp::Add=>IrBinary::Add, BinaryOp::Sub=>IrBinary::Sub, BinaryOp::Mul=>IrBinary::Mul,
+                    BinaryOp::Div=>IrBinary::Div, BinaryOp::Rem=>IrBinary::Rem,
+                    BinaryOp::BitAnd=>IrBinary::BitAnd, BinaryOp::BitOr=>IrBinary::BitOr, BinaryOp::BitXor=>IrBinary::BitXor,
+                    BinaryOp::Equal=>IrBinary::Equal, BinaryOp::NotEqual=>IrBinary::NotEqual,
+                    BinaryOp::Less=>IrBinary::Less, BinaryOp::LessEqual=>IrBinary::LessEqual,
+                    BinaryOp::Greater=>IrBinary::Greater, BinaryOp::GreaterEqual=>IrBinary::GreaterEqual,
+                    BinaryOp::LogicalAnd|BinaryOp::LogicalOr => unreachable!(),
+                };
+                self.emit(Instruction::Binary { dst, op, lhs, rhs }); dst
+            }
+        }
+    }
+    fn logical(&mut self, left: &Expr, right: &Expr, is_and: bool) -> ValueId {
+        let lhs = self.expression(left);
+        let rhs_block = self.new_block(); let short_block = self.new_block(); let merge_block = self.new_block();
+        let result = self.value();
+        let (if_zero, if_nonzero) = if is_and { (short_block, rhs_block) } else { (rhs_block, short_block) };
+        self.terminate(Terminator::Branch { condition: lhs, if_zero, if_nonzero });
+        self.current = short_block;
+        self.emit(Instruction::Const { dst: result, value: i64::from(!is_and) });
+        self.terminate(Terminator::Jump(merge_block));
+        self.current = rhs_block;
+        let rhs = self.expression(right);
+        self.emit(Instruction::ToBool { dst: result, src: rhs });
+        self.terminate(Terminator::Jump(merge_block));
+        self.current = merge_block;
+        result
     }
 }
 
@@ -200,32 +229,26 @@ fn expr_to_ast(e: &IrExpr) -> Expr {
 mod tests {
     use super::*;
     use crate::{lexer::lex, parser::Parser, sema};
-    fn lower_source(s: &str) -> IrProgram {
-        let ast = Parser::new(lex(s).unwrap()).parse().unwrap();
+    fn lower_source(source: &str) -> IrProgram {
+        let ast = Parser::new(lex(source).unwrap()).parse().unwrap();
         optimize(lower(&sema::analyze(&ast).unwrap()))
     }
-    #[test] fn folds_arithmetic_and_comparisons() {
-        let p=lower_source("int main(){return 2+3*4==14;}");
-        assert_eq!(p.statements, vec![IrStmt::Return(IrExpr::Const(1))]);
+    #[test]
+    fn produces_explicit_blocks_and_terminators() {
+        let p = lower_source("int main(){int x=0;while(x<3)x=x+1;return x;}");
+        assert!(p.blocks.len() >= 4);
+        assert!(p.blocks.iter().all(|b| b.terminator.is_some()));
+        assert!(p.blocks.iter().any(|b| matches!(b.terminator, Some(Terminator::Branch { .. }))));
     }
-    #[test] fn folds_unary_ops() {
-        let p=lower_source("int main(){return !0 + ~0;}");
-        assert_eq!(p.statements, vec![IrStmt::Return(IrExpr::Const(0))]);
+    #[test]
+    fn logical_operators_use_control_flow() {
+        let p = lower_source("int main(){return 0 && (1/0);}");
+        assert!(p.blocks.iter().any(|b| matches!(b.terminator, Some(Terminator::Branch { .. }))));
+        assert!(p.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Binary { op: IrBinary::Div, .. })));
     }
-    #[test] fn folds_short_circuit_without_evaluating_unreachable_rhs() {
-        let p=lower_source("int main(){return 0 && (1/0);}");
-        assert_eq!(p.statements, vec![IrStmt::Return(IrExpr::Const(0))]);
-        let p=lower_source("int main(){return 1 || (1/0);}");
-        assert_eq!(p.statements, vec![IrStmt::Return(IrExpr::Const(1))]);
-    }
-    #[test] fn does_not_fold_division_by_zero() {
-        let p=lower_source("int main(){return 1/0;}");
-        assert!(matches!(&p.statements[0], IrStmt::Return(IrExpr::Binary { op: IrBinary::Div, .. })));
-    }
-    #[test] fn leaves_runtime_expressions_alone() {
-        let p=lower_source("int main(){int x=2;return x+3*4;}");
-        let IrStmt::Return(IrExpr::Binary { lhs, rhs, .. })=&p.statements[1] else { panic!() };
-        assert!(matches!(lhs.as_ref(),IrExpr::Local(_)));
-        assert_eq!(rhs.as_ref(),&IrExpr::Const(12));
+    #[test]
+    fn folds_constants_inside_blocks() {
+        let p = lower_source("int main(){return 2+3*4;}");
+        assert!(p.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Const { value: 14, .. })));
     }
 }
