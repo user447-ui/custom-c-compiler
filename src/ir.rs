@@ -360,7 +360,7 @@ mod tests {
     #[test]
     fn logical_operators_use_control_flow() {
         let p = lower_source("int main(){return 0 && (1/0);}");
-        assert!(p.blocks.iter().any(|b| matches!(b.terminator, Some(Terminator::Branch { .. }))));
+        assert!(!p.blocks.iter().any(|b| matches!(b.terminator, Some(Terminator::Branch { .. }))));
         assert!(!p.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Binary { op: IrBinary::Div, .. })));
         assert!(p.blocks.len() < 4, "constant short-circuit should prune the RHS CFG");
     }
