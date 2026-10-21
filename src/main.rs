@@ -2,7 +2,7 @@ mod ast; mod codegen; mod elf; mod ir; mod lexer; mod parser; mod sema;
 use std::{env,fs,process};
 fn run()->Result<(),String>{
  let a:Vec<String>=env::args().collect();
- if a.len()==2&&a[1]=="--version"{println!("ccc 0.7.0 (x86_64-linux-gnu)");return Ok(())}
+ if a.len()==2&&a[1]=="--version"{println!("ccc 0.8.0 (x86_64-linux-gnu)");return Ok(())}
  if a.len()!=4||a[1]!="-o"{return Err("usage: ccc -o OUTPUT INPUT.c\n       ccc --version".into())}
  let source=fs::read_to_string(&a[3]).map_err(|e|format!("cannot read {}: {e}",a[3]))?;
  let tokens=lexer::lex(&source)?;
