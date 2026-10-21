@@ -2,7 +2,7 @@
 
 Experimental Rust compiler with a long-term goal of C17/C++20 frontends and a native x86-64 Linux backend. It emits machine code and ELF executables directly, without GCC, Clang, LLVM, an assembler, or a linker.
 
-## Current status: 0.6.0 bootstrap
+## Current status: 0.7.0 bootstrap
 
 Implemented subset: one `int main()` or `int main(void)` function; decimal integer literals; parentheses; unary `+`, `-`, `~`, `!`; arithmetic `+`, `-`, `*`, signed `/`, `%`; bitwise `&`, `|`, `^`; comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`; short-circuit logical `&&`, `||`; local `int` declarations and assignment; nested blocks with lexical scope and shadowing; `if`/`else`; `while`; and `return`. Comparisons and logical operators produce integer 0 or 1.
 
@@ -36,6 +36,7 @@ Expected exit status: `5`.
 - `src/ast.rs`: statement and expression AST.
 - `src/parser.rs`: grammar and Pratt expression parser.
 - `src/sema.rs`: lexical scopes, identifier resolution, definite-assignment diagnostics.
+- `src/ir.rs`: target-independent integer IR, lowering and constant folding.
 - `src/codegen.rs`: stack slots, x86-64 emission, branch fixups, short-circuit control flow.
 - `src/elf.rs`: minimal ELF64 executable writer.
 - `tests/e2e.rs`: compile-and-run tests.
@@ -47,7 +48,8 @@ Expected exit status: `5`.
 - [x] Comparisons and short-circuit logical operators.
 - [x] Separate semantic analysis and lexical scope/shadowing.
 - [x] Definite-assignment analysis.
-- [ ] Target-independent typed IR and constant folding.
+- [x] Target-independent integer IR and constant folding.
+- [ ] Direct IR-to-machine-code lowering and basic-block IR.
 - [ ] C types, pointers, arrays, structs, enums, preprocessing and multiple translation units.
 - [ ] ELF relocatable objects, symbols, relocations and linking.
 - [ ] Broader C17 conformance, then incremental C++20 features.
