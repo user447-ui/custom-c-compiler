@@ -58,6 +58,194 @@ pub fn lower(program: &Program) -> IrProgram {
     IrProgram { locals: builder.locals, value_count: builder.value_count, blocks: builder.blocks, entry: 0 }
 }
 
+
+/// Promote local variables to SSA using dominators, dominance frontiers, and renaming.
+/// Existing expression-value phi nodes are preserved.
+pub fn promote_locals_to_ssa(program: &mut IrProgram) {
+    use std::collections::{HashMap, HashSet};
+    let n = program.blocks.len();
+    if n == 0 || program.entry >= n { return; }
+    fn successors(block: &BasicBlock) -> Vec<BlockId> {
+        match block.terminator {
+            Some(Terminator::Jump(t)) => vec![t],
+            Some(Terminator::Branch { if_zero, if_nonzero, .. }) if if_zero == if_nonzero => vec![if_zero],
+            Some(Terminator::Branch { if_zero, if_nonzero, .. }) => vec![if_zero, if_nonzero],
+            _ => Vec::new(),
+        }
+    }
+    let mut preds = vec![Vec::<BlockId>::new(); n];
+    for block in &program.blocks {
+        for succ in successors(block) {
+            if succ < n && !preds[succ].contains(&block.id) { preds[succ].push(block.id); }
+        }
+    }
+    let mut reachable = vec![false; n];
+    let mut work = vec![program.entry];
+    while let Some(b) = work.pop() {
+        if b >= n || reachable[b] { continue; }
+        reachable[b] = true;
+        work.extend(successors(&program.blocks[b]));
+    }
+    let universe: HashSet<BlockId> = (0..n).filter(|b| reachable[*b]).collect();
+    let mut dom = vec![HashSet::<BlockId>::new(); n];
+    for b in 0..n {
+        if reachable[b] { dom[b] = if b == program.entry { [b].into_iter().collect() } else { universe.clone() }; }
+    }
+    loop {
+        let mut changed = false;
+        for b in 0..n {
+            if !reachable[b] || b == program.entry { continue; }
+            let incoming: Vec<_> = preds[b].iter().copied().filter(|p| reachable[*p]).collect();
+            let mut next = if let Some(first) = incoming.first() { dom[*first].clone() } else { HashSet::new() };
+            for p in incoming.iter().skip(1) { next.retain(|d| dom[*p].contains(d)); }
+            next.insert(b);
+            if next != dom[b] { dom[b] = next; changed = true; }
+        }
+        if !changed { break; }
+    }
+    let mut idom = vec![None; n];
+    for b in 0..n {
+        if reachable[b] && b != program.entry {
+            idom[b] = dom[b].iter().copied().filter(|d| *d != b).max_by_key(|d| dom[*d].len());
+        }
+    }
+    let mut children = vec![Vec::<BlockId>::new(); n];
+    for b in 0..n { if let Some(parent) = idom[b] { children[parent].push(b); } }
+    let mut frontier = vec![HashSet::<BlockId>::new(); n];
+    for b in 0..n {
+        if !reachable[b] || preds[b].iter().filter(|p| reachable[**p]).count() < 2 { continue; }
+        for pred in preds[b].iter().copied().filter(|p| reachable[*p]) {
+            let mut runner = Some(pred);
+            while let Some(r) = runner {
+                if Some(r) == idom[b] { break; }
+                frontier[r].insert(b);
+                runner = idom[r];
+            }
+        }
+    }
+    let mut definitions = HashMap::<String, HashSet<BlockId>>::new();
+    for block in &program.blocks {
+        if reachable[block.id] {
+            for inst in &block.instructions {
+                if let Instruction::StoreLocal { name, .. } = inst {
+                    definitions.entry(name.clone()).or_default().insert(block.id);
+                }
+            }
+        }
+    }
+    let mut phi_vars = HashMap::<ValueId, String>::new();
+    for (name, def_blocks) in definitions {
+        let mut has_phi = HashSet::new();
+        let mut queue: Vec<_> = def_blocks.iter().copied().collect();
+        while let Some(def_block) = queue.pop() {
+            for target in frontier[def_block].iter().copied() {
+                if !has_phi.insert(target) { continue; }
+                let dst = program.value_count;
+                program.value_count += 1;
+                phi_vars.insert(dst, name.clone());
+                program.blocks[target].instructions.insert(0, Instruction::Phi { dst, incoming: Vec::new() });
+                if !def_blocks.contains(&target) { queue.push(target); }
+            }
+        }
+    }
+    fn resolve(mut value: ValueId, aliases: &HashMap<ValueId, ValueId>) -> ValueId {
+        let mut steps = 0;
+        while let Some(next) = aliases.get(&value).copied() {
+            if next == value || steps > aliases.len() { break; }
+            value = next;
+            steps += 1;
+        }
+        value
+    }
+    fn rename_block(
+        b: BlockId, program: &mut IrProgram, children: &[Vec<BlockId>],
+        phi_vars: &HashMap<ValueId, String>, stacks: &mut HashMap<String, Vec<ValueId>>,
+        aliases: &mut HashMap<ValueId, ValueId>, out_versions: &mut [HashMap<String, ValueId>],
+    ) {
+        let mut pushed = Vec::<String>::new();
+        let original = std::mem::take(&mut program.blocks[b].instructions);
+        let mut rewritten = Vec::with_capacity(original.len());
+        for inst in original {
+            match inst {
+                Instruction::Phi { dst, incoming } => {
+                    if let Some(name) = phi_vars.get(&dst) {
+                        stacks.entry(name.clone()).or_default().push(dst);
+                        pushed.push(name.clone());
+                        rewritten.push(Instruction::Phi { dst, incoming });
+                    } else {
+                        rewritten.push(Instruction::Phi { dst, incoming: incoming.into_iter()
+                            .map(|(pred, value)| (pred, resolve(value, aliases))).collect() });
+                    }
+                }
+                Instruction::LoadLocal { dst, name } => {
+                    if let Some(value) = stacks.get(&name).and_then(|s| s.last()).copied() {
+                        aliases.insert(dst, value);
+                    } else {
+                        rewritten.push(Instruction::LoadLocal { dst, name });
+                    }
+                }
+                Instruction::StoreLocal { name, src } => {
+                    stacks.entry(name.clone()).or_default().push(resolve(src, aliases));
+                    pushed.push(name);
+                }
+                Instruction::Const { dst, value } => rewritten.push(Instruction::Const { dst, value }),
+                Instruction::Unary { dst, op, src } =>
+                    rewritten.push(Instruction::Unary { dst, op, src: resolve(src, aliases) }),
+                Instruction::Binary { dst, op, lhs, rhs } =>
+                    rewritten.push(Instruction::Binary { dst, op, lhs: resolve(lhs, aliases), rhs: resolve(rhs, aliases) }),
+                Instruction::ToBool { dst, src } =>
+                    rewritten.push(Instruction::ToBool { dst, src: resolve(src, aliases) }),
+            }
+        }
+        program.blocks[b].instructions = rewritten;
+        if let Some(term) = program.blocks[b].terminator {
+            program.blocks[b].terminator = Some(match term {
+                Terminator::Branch { condition, if_zero, if_nonzero } =>
+                    Terminator::Branch { condition: resolve(condition, aliases), if_zero, if_nonzero },
+                Terminator::Return(value) => Terminator::Return(resolve(value, aliases)),
+                other => other,
+            });
+        }
+        for (name, stack) in stacks.iter() {
+            if let Some(value) = stack.last() { out_versions[b].insert(name.clone(), *value); }
+        }
+        for child in children[b].clone() {
+            rename_block(child, program, children, phi_vars, stacks, aliases, out_versions);
+        }
+        for name in pushed.into_iter().rev() {
+            if let Some(stack) = stacks.get_mut(&name) { stack.pop(); }
+        }
+    }
+    let mut stacks = HashMap::<String, Vec<ValueId>>::new();
+    let mut aliases = HashMap::<ValueId, ValueId>::new();
+    let mut out_versions = vec![HashMap::<String, ValueId>::new(); n];
+    rename_block(program.entry, program, &children, &phi_vars, &mut stacks, &mut aliases, &mut out_versions);
+    for b in 0..n {
+        let incoming_preds = preds[b].clone();
+        for inst in &mut program.blocks[b].instructions {
+            if let Instruction::Phi { dst, incoming } = inst {
+                if let Some(name) = phi_vars.get(dst) {
+                    *incoming = incoming_preds.iter().filter_map(|pred| {
+                        out_versions[*pred].get(name).copied().map(|v| (*pred, v))
+                    }).collect();
+                } else {
+                    for (_, value) in incoming.iter_mut() { *value = resolve(*value, &aliases); }
+                }
+            }
+        }
+    }
+    for block in &mut program.blocks {
+        if let Some(term) = block.terminator {
+            block.terminator = Some(match term {
+                Terminator::Branch { condition, if_zero, if_nonzero } =>
+                    Terminator::Branch { condition: resolve(condition, &aliases), if_zero, if_nonzero },
+                Terminator::Return(value) => Terminator::Return(resolve(value, &aliases)),
+                other => other,
+            });
+        }
+    }
+}
+
 /// Fold constants inside each basic block. Control-flow edges and short-circuit
 /// branches are explicit, so this pass never evaluates an untaken branch.
 pub fn optimize(mut program: IrProgram) -> IrProgram {
