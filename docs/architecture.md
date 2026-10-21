@@ -1,12 +1,12 @@
 # Compiler architecture
 
 ```text
-CLI -> lexer -> parser/AST -> semantic analysis -> target-independent integer IR -> constant folding -> native x86-64 backend -> ELF64 executable
+CLI -> lexer -> parser/AST -> semantic analysis -> basic-block IR -> block-local constant folding -> direct native x86-64 backend -> ELF64 executable
 ```
 
-The frontend and semantic checks operate on the resolved AST. `src/ir.rs` lowers that AST to a separate integer IR with explicit local, constant, unary, binary, store, branch, loop and return nodes. Its optimizer folds constant arithmetic, bitwise operations, comparisons and logical expressions where evaluation is safe. It uses checked arithmetic, so overflow, division by zero, and signed division overflow are left for runtime rather than being folded. Short-circuit simplification avoids even optimizing an unreachable right operand when the left constant determines `&&` or `||`.
+The frontend and semantic checks operate on the resolved AST. `src/ir.rs` lowers the AST into a target-independent control-flow graph. Each basic block contains instructions over virtual values and ends in an explicit jump, conditional branch, or return. Logical `&&` and `||` are lowered to branches so the right-hand operand executes only when required. Constant folding runs within individual blocks and uses checked arithmetic, so overflow, division by zero, and signed division overflow are not folded.
 
-The backend currently has a temporary adapter that converts optimized IR back to the existing AST-shaped form before x86-64 emission. This isolates the new representation and lets optimizations run now; a follow-up should replace the adapter with direct IR instruction/basic-block code generation.
+The native backend consumes this IR directly; the former IR-to-AST adapter has been removed. It assigns stable stack homes to local variables and virtual values, emits each block in order, and patches relative branch displacements after block offsets are known. Stack homes rather than SSA/phi nodes keep control-flow joins straightforward for this bootstrap. The generated process exits via Linux x86-64 syscall 60. Output is a minimal ELF64 executable, not a relocatable object file.
 
 The bootstrap grammar accepts one `int main()` or `int main(void)` function. Statements include initialized/uninitialized local `int` declarations, assignment, nested blocks, `if`/`else`, `while`, and `return`. Expressions support integer literals, local reads, unary `+`/`-`/`~`/`!`, arithmetic, bitwise operators, signed comparisons, and short-circuit logical operators.
 
@@ -14,4 +14,4 @@ The semantic pass maintains lexical scopes, resolves uses to the nearest visible
 
 This prototype is not C-conforming yet. Function calls, the C ABI, preprocessing, pointers, arrays, structures, floating point, and multiple translation units remain future work.
 
-Next: direct IR-to-machine-code lowering, basic blocks, and explicit control-flow edges.
+Next: validate the direct backend broadly, then improve IR optimization and eventually add register allocation.

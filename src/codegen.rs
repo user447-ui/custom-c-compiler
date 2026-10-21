@@ -1,91 +1,164 @@
 use std::collections::HashMap;
-use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
+use crate::ir::{BlockId, Instruction, IrBinary, IrProgram, IrUnary, Terminator, ValueId};
 
-pub fn generate(ir: &crate::ir::IrProgram) -> Result<Vec<u8>, String> {
-    let p = ir.to_ast();
-    let p = &p;
-    let mut names=Vec::new(); collect(&p.statements,&mut names)?;
-    let slots:HashMap<String,i32>=names.iter().enumerate().map(|(i,n)|(n.clone(),((i+1)*8) as i32)).collect();
-    let frame=((names.len()*8+15)/16*16) as u32;
-    let mut g=Gen{c:Vec::new(),slots,labels:Vec::new(),patches:Vec::new()};
-    g.c.extend_from_slice(&[0x55,0x48,0x89,0xe5]);
-    if frame>0 { g.c.extend_from_slice(&[0x48,0x81,0xec]); g.c.extend_from_slice(&frame.to_le_bytes()); }
-    for s in &p.statements { g.stmt(s)?; }
-    g.c.extend_from_slice(&[0x48,0xb8]); g.c.extend_from_slice(&0i64.to_le_bytes());
-    g.c.extend_from_slice(&[0x48,0x89,0xc7,0xb8,60,0,0,0,0x0f,0x05]);
-    for (at,l) in g.patches.clone() {
-        let target=*g.labels.get(l).ok_or("unresolved branch label")? as i64;
-        let delta=i32::try_from(target-(at+4) as i64).map_err(|_|"branch out of range")?;
-        g.c[at..at+4].copy_from_slice(&delta.to_le_bytes());
+pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
+    if program.blocks.is_empty() || program.entry >= program.blocks.len() {
+        return Err("invalid IR: missing entry block".into());
     }
-    Ok(g.c)
+    let mut local_slots = HashMap::new();
+    let mut next_slot = 1i32;
+    for name in &program.locals {
+        if local_slots.insert(name.clone(), next_slot * 8).is_some() {
+            return Err(format!("duplicate IR local '{name}'"));
+        }
+        next_slot += 1;
+    }
+    let mut value_slots = Vec::with_capacity(program.value_count);
+    for _ in 0..program.value_count {
+        value_slots.push(next_slot * 8);
+        next_slot += 1;
+    }
+    let frame = (((next_slot as usize - 1) * 8 + 15) / 16 * 16) as u32;
+    let mut g = Generator {
+        code: Vec::new(), local_slots, value_slots,
+        block_offsets: vec![usize::MAX; program.blocks.len()], patches: Vec::new(),
+    };
+    // Function prologue. Every IR value has a stable stack home, which makes this
+    // first direct backend simple and keeps control-flow joins correct without phi nodes.
+    g.code.extend_from_slice(&[0x55, 0x48, 0x89, 0xe5]);
+    if frame != 0 {
+        g.code.extend_from_slice(&[0x48, 0x81, 0xec]);
+        g.code.extend_from_slice(&frame.to_le_bytes());
+    }
+    for block in &program.blocks {
+        if block.id >= program.blocks.len() {
+            return Err("invalid IR: block id out of range".into());
+        }
+        g.block_offsets[block.id] = g.code.len();
+        for instruction in &block.instructions { g.instruction(instruction)?; }
+        let terminator = block.terminator.ok_or_else(|| format!("invalid IR: block {} has no terminator", block.id))?;
+        g.terminator(terminator)?;
+    }
+    for (at, target) in g.patches.clone() {
+        let target = *g.block_offsets.get(target).ok_or("invalid IR branch target")?;
+        if target == usize::MAX { return Err("invalid IR: unresolved block target".into()); }
+        let delta = i32::try_from(target as i64 - (at + 4) as i64)
+            .map_err(|_| "branch displacement out of range")?;
+        g.code[at..at + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+    Ok(g.code)
 }
-fn collect(ss:&[Stmt],v:&mut Vec<String>)->Result<(),String>{
-    for s in ss { match s {
-        Stmt::Declaration{name,..}=>{if v.contains(name){return Err(format!("duplicate backend variable '{name}'"));}v.push(name.clone());},
-        Stmt::Block(b)=>collect(b,v)?,
-        Stmt::If{then_branch,else_branch,..}=>{collect_one(then_branch,v)?;if let Some(x)=else_branch{collect_one(x,v)?}},
-        Stmt::While{body,..}=>collect_one(body,v)?, _=>{},
-    }} Ok(())
+
+struct Generator {
+    code: Vec<u8>,
+    local_slots: HashMap<String, i32>,
+    value_slots: Vec<i32>,
+    block_offsets: Vec<usize>,
+    patches: Vec<(usize, BlockId)>,
 }
-fn collect_one(s:&Stmt,v:&mut Vec<String>)->Result<(),String>{match s{
-    Stmt::Block(b)=>collect(b,v),
-    Stmt::Declaration{name,..}=>{if v.contains(name){return Err(format!("duplicate backend variable '{name}'"));}v.push(name.clone());Ok(())},
-    Stmt::If{then_branch,else_branch,..}=>{collect_one(then_branch,v)?;if let Some(x)=else_branch{collect_one(x,v)?}Ok(())},
-    Stmt::While{body,..}=>collect_one(body,v),_=>Ok(())
-}}
-struct Gen{c:Vec<u8>,slots:HashMap<String,i32>,labels:Vec<usize>,patches:Vec<(usize,usize)>}
-impl Gen {
-    fn label(&mut self)->usize{let i=self.labels.len();self.labels.push(usize::MAX);i}
-    fn mark(&mut self,l:usize){self.labels[l]=self.c.len();}
-    fn jump(&mut self,cond:bool,l:usize){if cond{self.c.extend_from_slice(&[0x0f,0x84]);}else{self.c.push(0xe9);}let at=self.c.len();self.c.extend_from_slice(&[0;4]);self.patches.push((at,l));}
-    fn jump_nonzero(&mut self,l:usize){self.c.extend_from_slice(&[0x0f,0x85]);let at=self.c.len();self.c.extend_from_slice(&[0;4]);self.patches.push((at,l));}
-    fn slot(&self,n:&str)->Result<i32,String>{self.slots.get(n).copied().ok_or_else(||format!("internal error: unresolved variable '{n}'"))}
-    fn stmt(&mut self,s:&Stmt)->Result<(),String>{match s{
-        Stmt::Declaration{name,initializer}=>if let Some(e)=initializer{self.expr(e)?;let d=self.slot(name)?;self.c.extend_from_slice(&[0x48,0x89,0x85]);self.c.extend_from_slice(&(-d).to_le_bytes());},
-        Stmt::Assignment{name,value}=>{self.expr(value)?;let d=self.slot(name)?;self.c.extend_from_slice(&[0x48,0x89,0x85]);self.c.extend_from_slice(&(-d).to_le_bytes());},
-        Stmt::Return(e)=>{self.expr(e)?;self.c.extend_from_slice(&[0x48,0x89,0xc7,0xb8,60,0,0,0,0x0f,0x05]);},
-        Stmt::Block(b)=>for x in b{self.stmt(x)?},
-        Stmt::If{condition,then_branch,else_branch}=>{let other=self.label();let end=self.label();self.expr(condition)?;self.c.extend_from_slice(&[0x48,0x85,0xc0]);self.jump(true,other);self.stmt(then_branch)?;if let Some(x)=else_branch{self.jump(false,end);self.mark(other);self.stmt(x)?;self.mark(end);}else{self.mark(other);}},
-        Stmt::While{condition,body}=>{let start=self.label();let end=self.label();self.mark(start);self.expr(condition)?;self.c.extend_from_slice(&[0x48,0x85,0xc0]);self.jump(true,end);self.stmt(body)?;self.jump(false,start);self.mark(end);},
-    } Ok(())}
-    fn expr(&mut self,e:&Expr)->Result<(),String>{match e{
-        Expr::Number(n)=>{self.c.extend_from_slice(&[0x48,0xb8]);self.c.extend_from_slice(&n.to_le_bytes());},
-        Expr::Variable(n)=>{let d=self.slot(n)?;self.c.extend_from_slice(&[0x48,0x8b,0x85]);self.c.extend_from_slice(&(-d).to_le_bytes());},
-        Expr::Unary{op,expr}=>{self.expr(expr)?;match op{UnaryOp::Plus=>{},UnaryOp::Minus=>self.c.extend_from_slice(&[0x48,0xf7,0xd8]),UnaryOp::BitNot=>self.c.extend_from_slice(&[0x48,0xf7,0xd0]),UnaryOp::LogicalNot=>self.c.extend_from_slice(&[0x48,0x85,0xc0,0x0f,0x94,0xc0,0x48,0x0f,0xb6,0xc0])}},
-        Expr::Binary{op,left,right}=>{
-            if *op==BinaryOp::LogicalAnd { self.logical_and(left,right)?; return Ok(()); }
-            if *op==BinaryOp::LogicalOr { self.logical_or(left,right)?; return Ok(()); }
-            self.expr(left)?;self.c.push(0x50);self.expr(right)?;self.c.push(0x59);
-            match op{
-                BinaryOp::Add=>self.c.extend_from_slice(&[0x48,0x01,0xc8]),
-                BinaryOp::Sub=>self.c.extend_from_slice(&[0x48,0x89,0xc2,0x48,0x89,0xc8,0x48,0x29,0xd0]),
-                BinaryOp::Mul=>self.c.extend_from_slice(&[0x48,0x0f,0xaf,0xc1]),
-                BinaryOp::BitAnd=>self.c.extend_from_slice(&[0x48,0x21,0xc8]),
-                BinaryOp::BitOr=>self.c.extend_from_slice(&[0x48,0x09,0xc8]),
-                BinaryOp::BitXor=>self.c.extend_from_slice(&[0x48,0x31,0xc8]),
-                BinaryOp::Div|BinaryOp::Rem=>{self.c.extend_from_slice(&[0x48,0x89,0xc6,0x48,0x89,0xc8,0x48,0x99,0x48,0xf7,0xfe]);if *op==BinaryOp::Rem{self.c.extend_from_slice(&[0x48,0x89,0xd0]);}},
-                BinaryOp::Equal|BinaryOp::NotEqual|BinaryOp::Less|BinaryOp::LessEqual|BinaryOp::Greater|BinaryOp::GreaterEqual=>{
-                    self.c.extend_from_slice(&[0x48,0x39,0xc1]);
-                    let cc=match op{BinaryOp::Equal=>0x94,BinaryOp::NotEqual=>0x95,BinaryOp::Less=>0x9c,BinaryOp::LessEqual=>0x9e,BinaryOp::Greater=>0x9f,BinaryOp::GreaterEqual=>0x9d,_=>unreachable!()};
-                    self.c.extend_from_slice(&[0x0f,cc,0xc0,0x48,0x0f,0xb6,0xc0]);
-                },
-                BinaryOp::LogicalAnd|BinaryOp::LogicalOr=>unreachable!(),
+impl Generator {
+    fn local(&self, name: &str) -> Result<i32, String> {
+        self.local_slots.get(name).copied()
+            .ok_or_else(|| format!("invalid IR: unknown local '{name}'"))
+    }
+    fn value(&self, id: ValueId) -> Result<i32, String> {
+        self.value_slots.get(id).copied()
+            .ok_or_else(|| format!("invalid IR: value %{id} out of range"))
+    }
+    fn load_rax(&mut self, displacement: i32) {
+        self.code.extend_from_slice(&[0x48, 0x8b, 0x85]);
+        self.code.extend_from_slice(&(-displacement).to_le_bytes());
+    }
+    fn load_rcx(&mut self, displacement: i32) {
+        self.code.extend_from_slice(&[0x48, 0x8b, 0x8d]);
+        self.code.extend_from_slice(&(-displacement).to_le_bytes());
+    }
+    fn store_rax(&mut self, displacement: i32) {
+        self.code.extend_from_slice(&[0x48, 0x89, 0x85]);
+        self.code.extend_from_slice(&(-displacement).to_le_bytes());
+    }
+    fn jump(&mut self, opcode: &[u8], target: BlockId) {
+        self.code.extend_from_slice(opcode);
+        let at = self.code.len();
+        self.code.extend_from_slice(&[0; 4]);
+        self.patches.push((at, target));
+    }
+    fn instruction(&mut self, inst: &Instruction) -> Result<(), String> {
+        match inst {
+            Instruction::Const { dst, value } => {
+                self.code.extend_from_slice(&[0x48, 0xb8]);
+                self.code.extend_from_slice(&value.to_le_bytes());
+                self.store_rax(self.value(*dst)?);
             }
-        },
-    } Ok(())}
-    fn logical_and(&mut self,l:&Expr,r:&Expr)->Result<(),String>{
-        let no=self.label();let end=self.label();
-        self.expr(l)?;self.c.extend_from_slice(&[0x48,0x85,0xc0]);self.jump(true,no);
-        self.expr(r)?;self.c.extend_from_slice(&[0x48,0x85,0xc0]);self.jump(true,no);
-        self.c.extend_from_slice(&[0x48,0xb8,1,0,0,0,0,0,0,0]);self.jump(false,end);
-        self.mark(no);self.c.extend_from_slice(&[0x48,0xb8,0,0,0,0,0,0,0,0]);self.mark(end);Ok(())
+            Instruction::LoadLocal { dst, name } => {
+                self.load_rax(self.local(name)?);
+                self.store_rax(self.value(*dst)?);
+            }
+            Instruction::StoreLocal { name, src } => {
+                self.load_rax(self.value(*src)?);
+                self.store_rax(self.local(name)?);
+            }
+            Instruction::Unary { dst, op, src } => {
+                self.load_rax(self.value(*src)?);
+                match op {
+                    IrUnary::Plus => {}
+                    IrUnary::Negate => self.code.extend_from_slice(&[0x48, 0xf7, 0xd8]),
+                    IrUnary::BitNot => self.code.extend_from_slice(&[0x48, 0xf7, 0xd0]),
+                    IrUnary::LogicalNot => self.code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x94, 0xc0, 0x48, 0x0f, 0xb6, 0xc0]),
+                }
+                self.store_rax(self.value(*dst)?);
+            }
+            Instruction::ToBool { dst, src } => {
+                self.load_rax(self.value(*src)?);
+                self.code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x95, 0xc0, 0x48, 0x0f, 0xb6, 0xc0]);
+                self.store_rax(self.value(*dst)?);
+            }
+            Instruction::Binary { dst, op, lhs, rhs } => {
+                self.load_rax(self.value(*lhs)?);
+                self.load_rcx(self.value(*rhs)?);
+                match op {
+                    IrBinary::Add => self.code.extend_from_slice(&[0x48, 0x01, 0xc8]),
+                    IrBinary::Sub => self.code.extend_from_slice(&[0x48, 0x29, 0xc8]),
+                    IrBinary::Mul => self.code.extend_from_slice(&[0x48, 0x0f, 0xaf, 0xc1]),
+                    IrBinary::Div | IrBinary::Rem => {
+                        self.code.extend_from_slice(&[0x48, 0x99, 0x48, 0xf7, 0xf9]);
+                        if *op == IrBinary::Rem { self.code.extend_from_slice(&[0x48, 0x89, 0xd0]); }
+                    }
+                    IrBinary::BitAnd => self.code.extend_from_slice(&[0x48, 0x21, 0xc8]),
+                    IrBinary::BitOr => self.code.extend_from_slice(&[0x48, 0x09, 0xc8]),
+                    IrBinary::BitXor => self.code.extend_from_slice(&[0x48, 0x31, 0xc8]),
+                    IrBinary::Equal | IrBinary::NotEqual | IrBinary::Less | IrBinary::LessEqual |
+                    IrBinary::Greater | IrBinary::GreaterEqual => {
+                        self.code.extend_from_slice(&[0x48, 0x39, 0xc8]);
+                        let cc = match op {
+                            IrBinary::Equal => 0x94, IrBinary::NotEqual => 0x95,
+                            IrBinary::Less => 0x9c, IrBinary::LessEqual => 0x9e,
+                            IrBinary::Greater => 0x9f, IrBinary::GreaterEqual => 0x9d,
+                            _ => unreachable!(),
+                        };
+                        self.code.extend_from_slice(&[0x0f, cc, 0xc0, 0x48, 0x0f, 0xb6, 0xc0]);
+                    }
+                }
+                self.store_rax(self.value(*dst)?);
+            }
+        }
+        Ok(())
     }
-    fn logical_or(&mut self,l:&Expr,r:&Expr)->Result<(),String>{
-        let yes=self.label();let end=self.label();
-        self.expr(l)?;self.c.extend_from_slice(&[0x48,0x85,0xc0]);self.jump_nonzero(yes);
-        self.expr(r)?;self.c.extend_from_slice(&[0x48,0x85,0xc0]);self.jump_nonzero(yes);
-        self.c.extend_from_slice(&[0x48,0xb8,0,0,0,0,0,0,0,0]);self.jump(false,end);
-        self.mark(yes);self.c.extend_from_slice(&[0x48,0xb8,1,0,0,0,0,0,0,0]);self.mark(end);Ok(())
+    fn terminator(&mut self, term: Terminator) -> Result<(), String> {
+        match term {
+            Terminator::Jump(target) => self.jump(&[0xe9], target),
+            Terminator::Branch { condition, if_zero, if_nonzero } => {
+                self.load_rax(self.value(condition)?);
+                self.code.extend_from_slice(&[0x48, 0x85, 0xc0]);
+                self.jump(&[0x0f, 0x84], if_zero);
+                self.jump(&[0xe9], if_nonzero);
+            }
+            Terminator::Return(value) => {
+                self.load_rax(self.value(value)?);
+                // Linux x86-64 sys_exit(status), intentionally no libc dependency.
+                self.code.extend_from_slice(&[0x48, 0x89, 0xc7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05]);
+            }
+        }
+        Ok(())
     }
 }
