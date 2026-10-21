@@ -1,7 +1,9 @@
 use std::collections::HashMap;
-use crate::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
 
-pub fn generate(p: &Program) -> Result<Vec<u8>, String> {
+pub fn generate(ir: &crate::ir::IrProgram) -> Result<Vec<u8>, String> {
+    let p = ir.to_ast();
+    let p = &p;
     let mut names=Vec::new(); collect(&p.statements,&mut names)?;
     let slots:HashMap<String,i32>=names.iter().enumerate().map(|(i,n)|(n.clone(),((i+1)*8) as i32)).collect();
     let frame=((names.len()*8+15)/16*16) as u32;
