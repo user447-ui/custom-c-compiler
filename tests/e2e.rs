@@ -17,10 +17,18 @@ fn compiles_and_runs_expressions_and_statements(){
  ("int x=3;{int x=7;x=x+1;}return x;",3),
  ("return 0 && (1/0);",0),("return 1 || (1/0);",1),
  ("return 1 && (2<3);",1),("return 0 || (2<3);",1),
+ ("int x;if(1)x=7;else x=8;return x;",7),
  ];
  for(i,(body,want))in cases.into_iter().enumerate(){fs::write(&src,format!("int main(void){{{body}}}")).unwrap();let c=Command::new(env!("CARGO_BIN_EXE_ccc")).arg("-o").arg(&out).arg(&src).output().unwrap();assert!(c.status.success(),"case {i}: {}",String::from_utf8_lossy(&c.stderr));let run=Command::new(&out).status().unwrap();assert_eq!(run.code(),Some(want),"case {i}: {body}");}
  let _=fs::remove_file(src);let _=fs::remove_file(out);
 }
 #[cfg(all(target_os="linux",target_arch="x86_64"))]
 #[test]
-fn rejects_invalid_names(){for (i,source) in ["int main(){return missing;}","int main(){int x; int x; return 0;}","int main(){x=2; int x; return 0;}"].into_iter().enumerate(){let p=std::env::temp_dir().join(format!("ccc-bad-{}-{i}.c",std::process::id()));fs::write(&p,source).unwrap();let out=p.with_extension("out");let c=Command::new(env!("CARGO_BIN_EXE_ccc")).arg("-o").arg(&out).arg(&p).output().unwrap();assert!(!c.status.success(),"accepted invalid source: {source}");let _=fs::remove_file(p);let _=fs::remove_file(out);}}
+fn rejects_invalid_names_and_uninitialized_reads(){for (i,source) in [
+ "int main(){return missing;}",
+ "int main(){int x; int x; return 0;}",
+ "int main(){x=2; int x; return 0;}",
+ "int main(){int x; return x;}",
+ "int main(){int x;if(1)x=3;return x;}",
+ "int main(){int x;while(0)x=4;return x;}",
+].into_iter().enumerate(){let p=std::env::temp_dir().join(format!("ccc-bad-{}-{i}.c",std::process::id()));fs::write(&p,source).unwrap();let out=p.with_extension("out");let c=Command::new(env!("CARGO_BIN_EXE_ccc")).arg("-o").arg(&out).arg(&p).output().unwrap();assert!(!c.status.success(),"accepted invalid source: {source}");let _=fs::remove_file(p);let _=fs::remove_file(out);}}

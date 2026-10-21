@@ -2,7 +2,7 @@
 
 Experimental Rust compiler with a long-term goal of C17/C++20 frontends and a native x86-64 Linux backend. It emits machine code and ELF executables directly, without GCC, Clang, LLVM, an assembler, or a linker.
 
-## Current status: 0.5.0 bootstrap
+## Current status: 0.6.0 bootstrap
 
 Implemented subset: one `int main()` or `int main(void)` function; decimal integer literals; parentheses; unary `+`, `-`, `~`, `!`; arithmetic `+`, `-`, `*`, signed `/`, `%`; bitwise `&`, `|`, `^`; comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`; short-circuit logical `&&`, `||`; local `int` declarations and assignment; nested blocks with lexical scope and shadowing; `if`/`else`; `while`; and `return`. Comparisons and logical operators produce integer 0 or 1.
 
@@ -15,7 +15,7 @@ int main(void) {
 }
 ```
 
-A semantic-analysis pass resolves names, rejects use before declaration and same-scope redeclarations, and gives shadowed locals distinct internal names. Definite-assignment analysis is not implemented, so reading an uninitialized local is not diagnosed. This is not yet a conforming C compiler: `for`, function calls, multiple functions, full type checking, preprocessing, pointers, arrays, structs, floating point, and C++ syntax are not implemented. Target is Linux x86-64.
+Semantic analysis resolves names, rejects use before declaration and same-scope redeclarations, and gives shadowed locals distinct internal names. Definite-assignment analysis rejects reads of uninitialized locals, checks both `if` paths, and conservatively assumes loops may execute zero times. An assignment in a loop therefore does not by itself initialize a variable after the loop. The analysis does not yet model unreachable code or all C control-flow rules. This is not yet a conforming C compiler: `for`, function calls, multiple functions, full type checking, preprocessing, pointers, arrays, structs, floating point, and C++ syntax are not implemented. Target is Linux x86-64.
 
 ## Build and run
 
@@ -35,7 +35,7 @@ Expected exit status: `5`.
 - `src/lexer.rs`: tokens, offsets, C comments.
 - `src/ast.rs`: statement and expression AST.
 - `src/parser.rs`: grammar and Pratt expression parser.
-- `src/sema.rs`: lexical scopes, identifier resolution, declaration diagnostics.
+- `src/sema.rs`: lexical scopes, identifier resolution, definite-assignment diagnostics.
 - `src/codegen.rs`: stack slots, x86-64 emission, branch fixups, short-circuit control flow.
 - `src/elf.rs`: minimal ELF64 executable writer.
 - `tests/e2e.rs`: compile-and-run tests.
@@ -46,7 +46,7 @@ Expected exit status: `5`.
 - [x] Local variables, assignment, blocks, `if`/`else`, `while`.
 - [x] Comparisons and short-circuit logical operators.
 - [x] Separate semantic analysis and lexical scope/shadowing.
-- [ ] Definite-assignment analysis.
+- [x] Definite-assignment analysis.
 - [ ] Target-independent typed IR and constant folding.
 - [ ] C types, pointers, arrays, structs, enums, preprocessing and multiple translation units.
 - [ ] ELF relocatable objects, symbols, relocations and linking.
