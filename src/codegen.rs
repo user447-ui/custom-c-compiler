@@ -47,8 +47,8 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
         block_offsets: vec![usize::MAX; program.blocks.len() + edge_trampolines.len()],
         patches: Vec::new(), edge_targets, current_block: program.entry,
     };
-    // Function prologue. Every IR value has a stable stack home, which makes this
-    // first direct backend simple and keeps control-flow joins correct without phi nodes.
+    // Function prologue. Every IR value has a stable stack home; phi nodes
+    // are lowered to copies on the incoming control-flow edges.
     g.code.extend_from_slice(&[0x55, 0x48, 0x89, 0xe5]);
     if frame != 0 {
         g.code.extend_from_slice(&[0x48, 0x81, 0xec]);
@@ -80,7 +80,6 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
             }
         }
         g.jump(&[0xe9], target);
-    }
     }
     for (at, target) in g.patches.clone() {
         let target = *g.block_offsets.get(target).ok_or("invalid IR branch target")?;
