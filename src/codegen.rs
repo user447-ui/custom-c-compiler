@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use crate::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Stmt, UnaryOp};
 
 pub fn generate(ir: &crate::ir::IrProgram) -> Result<Vec<u8>, String> {
     let p = ir.to_ast();
