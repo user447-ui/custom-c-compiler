@@ -14,4 +14,4 @@ The semantic pass maintains lexical scopes, resolves uses to the nearest visible
 
 This prototype is not C-conforming yet. Function calls, the C ABI, preprocessing, pointers, arrays, structures, floating point, and multiple translation units remain future work.
 
-Full SSA construction for local variables and register allocation remain future work.
+Local-variable SSA construction uses iterative dominator sets, immediate dominators, dominance frontiers, phi placement, and variable renaming. Phi operands are filled from predecessor exit versions, which handles loop backedges. Register allocation remains future work.
