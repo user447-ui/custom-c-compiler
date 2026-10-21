@@ -1,4 +1,4 @@
-use crate::parser::{BinaryOp,Expr,UnaryOp};
+use crate::ast::{BinaryOp, Expr, UnaryOp};
 pub fn generate(expr:&Expr)->Result<Vec<u8>,String>{let mut code=Vec::new();emit_expr(expr,&mut code)?;code.extend_from_slice(&[0x48,0x89,0xc7,0xb8,60,0,0,0,0x0f,0x05]);Ok(code)}
 fn emit_expr(e:&Expr,out:&mut Vec<u8>)->Result<(),String>{match e{
  Expr::Number(n)=>{out.extend_from_slice(&[0x48,0xb8]);out.extend_from_slice(&n.to_le_bytes());},
