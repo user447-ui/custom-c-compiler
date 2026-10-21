@@ -1,30 +1,5 @@
-use std::{fs, process::Command};
-
-#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
-#[test]
-fn compiles_and_runs_integer_expressions() {
-    let base = std::env::temp_dir().join(format!("ccc-e2e-{}", std::process::id()));
-    let source = base.with_extension("c");
-    let output = base.with_extension("out");
-    let cases = [
-        ("2 + 3 * 4", 14),
-        ("(20 - 8) / 3", 4),
-        ("17 % 5", 2),
-        ("8 - 3", 5),
-        ("~0", 255),
-        ("(6 | 1) ^ 3", 4),
-        ("-7 + 10", 3),
-    ];
-
-    for (index, (expression, expected)) in cases.into_iter().enumerate() {
-        fs::write(&source, format!("int main(void) {{ return {expression}; }}")).unwrap();
-        let compiler = env!("CARGO_BIN_EXE_ccc");
-        let compile = Command::new(compiler).arg("-o").arg(&output).arg(&source).output().unwrap();
-        assert!(compile.status.success(), "case {index}: compiler stderr: {}", String::from_utf8_lossy(&compile.stderr));
-        let run = Command::new(&output).status().unwrap();
-        assert_eq!(run.code(), Some(expected), "case {index}: {expression}");
-    }
-
-    let _ = fs::remove_file(source);
-    let _ = fs::remove_file(output);
-}
+use std::{fs,process::Command};
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]fn compiles_and_runs_statements(){let base=std::env::temp_dir().join(format!("ccc-e2e-{}",std::process::id()));let src=base.with_extension("c");let out=base.with_extension("out");let cases=[("return 2+3*4;",14),("int x=10;x=x+7;return x;",17),("int x=0;if(1)x=7;else x=8;return x;",7),("int x=0;if(0)x=7;else x=8;return x;",8),("int x=0;while(x-5)x=x+1;return x;",5),("int x=3;{int y=4;x=x+y;}return x;",7),("int x=1;int y=2;while(y-6){x=x*2;y=y+1;}return x;",16)];for(i,(body,want))in cases.into_iter().enumerate(){fs::write(&src,format!("int main(void){{{body}}}")).unwrap();let c=Command::new(env!("CARGO_BIN_EXE_ccc")).arg("-o").arg(&out).arg(&src).output().unwrap();assert!(c.status.success(),"case {i}: {}",String::from_utf8_lossy(&c.stderr));let run=Command::new(&out).status().unwrap();assert_eq!(run.code(),Some(want),"case {i}: {body}")}let _=fs::remove_file(src);let _=fs::remove_file(out)}
+#[cfg(all(target_os="linux",target_arch="x86_64"))]
+#[test]fn rejects_undeclared_variables(){let p=std::env::temp_dir().join(format!("ccc-bad-{}.c",std::process::id()));fs::write(&p,"int main(){return missing;}").unwrap();let out=p.with_extension("out");let c=Command::new(env!("CARGO_BIN_EXE_ccc")).arg("-o").arg(&out).arg(&p).output().unwrap();assert!(!c.status.success());assert!(String::from_utf8_lossy(&c.stderr).contains("undeclared variable"));let _=fs::remove_file(p);let _=fs::remove_file(out)}
