@@ -91,7 +91,124 @@ pub fn optimize(mut program: IrProgram) -> IrProgram {
             }
         }
     }
+
+    // Re-run the inexpensive CFG passes because deleting a branch can expose
+    // unreachable blocks and values that are now dead.
+    for _ in 0..3 {
+        simplify_constant_branches(&mut program);
+        remove_unreachable_blocks(&mut program);
+        eliminate_dead_values(&mut program);
+    }
     program
+}
+
+fn simplify_constant_branches(program: &mut IrProgram) {
+    for block in &mut program.blocks {
+        let mut constants = std::collections::HashMap::<ValueId, i64>::new();
+        for inst in &block.instructions {
+            match inst {
+                Instruction::Const { dst, value } => { constants.insert(*dst, *value); }
+                Instruction::Unary { dst, op, src } => {
+                    let value = constants.get(src).copied().and_then(|n| match op {
+                        IrUnary::Plus => Some(n), IrUnary::Negate => n.checked_neg(),
+                        IrUnary::BitNot => Some(!n), IrUnary::LogicalNot => Some(i64::from(n == 0)),
+                    });
+                    if let Some(value) = value { constants.insert(*dst, value); }
+                }
+                Instruction::Binary { dst, op, lhs, rhs } => {
+                    if let Some(value) = constants.get(lhs).copied().zip(constants.get(rhs).copied())
+                        .and_then(|(a,b)| fold_binary(*op,a,b)) { constants.insert(*dst, value); }
+                }
+                Instruction::ToBool { dst, src } => {
+                    if let Some(n) = constants.get(src).copied() { constants.insert(*dst, i64::from(n != 0)); }
+                }
+                Instruction::LoadLocal { dst, .. } => { constants.remove(dst); }
+                Instruction::StoreLocal { .. } => {}
+            }
+        }
+        if let Some(Terminator::Branch { condition, if_zero, if_nonzero }) = block.terminator {
+            if let Some(value) = constants.get(&condition).copied() {
+                block.terminator = Some(Terminator::Jump(if value == 0 { if_zero } else { if_nonzero }));
+            }
+        }
+    }
+}
+
+fn remove_unreachable_blocks(program: &mut IrProgram) {
+    if program.blocks.is_empty() || program.entry >= program.blocks.len() { return; }
+    let mut reachable = vec![false; program.blocks.len()];
+    let mut worklist = vec![program.entry];
+    while let Some(id) = worklist.pop() {
+        if id >= program.blocks.len() || reachable[id] { continue; }
+        reachable[id] = true;
+        match program.blocks[id].terminator {
+            Some(Terminator::Jump(target)) => worklist.push(target),
+            Some(Terminator::Branch { if_zero, if_nonzero, .. }) => {
+                worklist.push(if_zero); worklist.push(if_nonzero);
+            }
+            Some(Terminator::Return(_)) | None => {}
+        }
+    }
+    let mut remap = vec![usize::MAX; program.blocks.len()];
+    let mut blocks = Vec::new();
+    for (old, block) in program.blocks.iter().enumerate() {
+        if reachable[old] {
+            remap[old] = blocks.len();
+            blocks.push(block.clone());
+        }
+    }
+    for block in &mut blocks {
+        block.id = remap[block.id];
+        block.terminator = block.terminator.map(|term| match term {
+            Terminator::Jump(target) => Terminator::Jump(remap[target]),
+            Terminator::Branch { condition, if_zero, if_nonzero } => Terminator::Branch {
+                condition, if_zero: remap[if_zero], if_nonzero: remap[if_nonzero],
+            },
+            other => other,
+        });
+    }
+    program.entry = remap[program.entry];
+    program.blocks = blocks;
+}
+
+fn eliminate_dead_values(program: &mut IrProgram) {
+    loop {
+        let mut uses = vec![0usize; program.value_count];
+        for block in &program.blocks {
+            for inst in &block.instructions {
+                match inst {
+                    Instruction::LoadLocal { .. } | Instruction::Const { .. } => {}
+                    Instruction::StoreLocal { src, .. } | Instruction::ToBool { src, .. } => {
+                        if let Some(n) = uses.get_mut(*src) { *n += 1; }
+                    }
+                    Instruction::Unary { src, .. } => {
+                        if let Some(n) = uses.get_mut(*src) { *n += 1; }
+                    }
+                    Instruction::Binary { lhs, rhs, .. } => {
+                        if let Some(n) = uses.get_mut(*lhs) { *n += 1; }
+                        if let Some(n) = uses.get_mut(*rhs) { *n += 1; }
+                    }
+                }
+            }
+            match block.terminator {
+                Some(Terminator::Branch { condition, .. }) | Some(Terminator::Return(condition)) => {
+                    if let Some(n) = uses.get_mut(condition) { *n += 1; }
+                }
+                _ => {}
+            }
+        }
+        let before: usize = program.blocks.iter().map(|b| b.instructions.len()).sum();
+        for block in &mut program.blocks {
+            block.instructions.retain(|inst| match inst {
+                Instruction::StoreLocal { .. } => true,
+                Instruction::Const { dst, .. } | Instruction::LoadLocal { dst, .. } |
+                Instruction::Unary { dst, .. } | Instruction::Binary { dst, .. } |
+                Instruction::ToBool { dst, .. } => uses.get(*dst).copied().unwrap_or(0) != 0,
+            });
+        }
+        let after: usize = program.blocks.iter().map(|b| b.instructions.len()).sum();
+        if before == after { break; }
+    }
 }
 
 fn fold_binary(op: IrBinary, a: i64, b: i64) -> Option<i64> {
@@ -244,7 +361,14 @@ mod tests {
     fn logical_operators_use_control_flow() {
         let p = lower_source("int main(){return 0 && (1/0);}");
         assert!(p.blocks.iter().any(|b| matches!(b.terminator, Some(Terminator::Branch { .. }))));
-        assert!(p.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Binary { op: IrBinary::Div, .. })));
+        assert!(!p.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Binary { op: IrBinary::Div, .. })));
+        assert!(p.blocks.len() < 4, "constant short-circuit should prune the RHS CFG");
+    }
+    #[test]
+    fn removes_unreachable_blocks_and_dead_values() {
+        let p = lower_source("int main(){int x=1;if(0){x=99;}return x;}");
+        assert!(!p.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Const { value: 99, .. })));
+        assert!(p.blocks.iter().all(|b| b.terminator.is_some()));
     }
     #[test]
     fn folds_constants_inside_blocks() {
