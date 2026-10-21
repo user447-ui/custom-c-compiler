@@ -1,4 +1,4 @@
-use crate::ast::{self, BinaryOp, Expr, Program, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
 
 /// Target-independent, typed-by-construction integer IR for the current C subset.
 /// Variable names have already been resolved by semantic analysis.
@@ -210,7 +210,7 @@ mod tests {
     }
     #[test] fn folds_unary_ops() {
         let p=lower_source("int main(){return !0 + ~0;}");
-        assert_eq!(p.statements, vec![IrStmt::Return(IrExpr::Const(-1))]);
+        assert_eq!(p.statements, vec![IrStmt::Return(IrExpr::Const(0))]);
     }
     #[test] fn folds_short_circuit_without_evaluating_unreachable_rhs() {
         let p=lower_source("int main(){return 0 && (1/0);}");
