@@ -1,21 +1,53 @@
 use std::collections::HashMap;
-use crate::ir::{BlockId, Instruction, IrBinary, IrProgram, IrUnary, Terminator, ValueId};
-use crate::regalloc::{self, Allocation, Location};
+use crate::ir::{BlockId, Instruction, IrBinary, IrFunction, IrModule, IrUnary, Terminator, ValueId};
+use crate::regalloc::{self, Allocation, Location, ALLOCATABLE_REGISTERS};
 
-pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
+/// System V AMD64 integer argument registers: RDI, RSI, RDX, RCX, R8, R9.
+const ARG_REGS: [u8; 6] = [7, 6, 2, 1, 8, 9];
+
+/// Machine code for one function plus the `call rel32` sites still to be resolved.
+struct FunctionCode { code: Vec<u8>, calls: Vec<(usize, String)> }
+
+/// Emit the whole module: a `_start` stub that calls `main` and exits with its
+/// result, followed by every function. Calls are patched once all offsets are known.
+pub fn generate(module: &IrModule) -> Result<Vec<u8>, String> {
+    let mut code = Vec::new();
+    // _start: call main; mov rdi, rax; mov eax, 60 (sys_exit); syscall
+    code.extend_from_slice(&[0xe8, 0, 0, 0, 0]);
+    code.extend_from_slice(&[0x48, 0x89, 0xc7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05]);
+    let mut calls = vec![(1usize, "main".to_string())];
+    let mut offsets = HashMap::<String, usize>::new();
+    for function in &module.functions {
+        if offsets.insert(function.name.clone(), code.len()).is_some() {
+            return Err(format!("invalid IR: duplicate function '{}'", function.name));
+        }
+        let FunctionCode { code: body, calls: sites } = generate_function(function)?;
+        let base = code.len();
+        code.extend_from_slice(&body);
+        calls.extend(sites.into_iter().map(|(at, name)| (base + at, name)));
+    }
+    for (at, name) in calls {
+        let target = *offsets.get(&name).ok_or_else(|| format!("undefined function '{name}'"))?;
+        let delta = i32::try_from(target as i64 - (at + 4) as i64).map_err(|_| "call displacement out of range")?;
+        code[at..at + 4].copy_from_slice(&delta.to_le_bytes());
+    }
+    Ok(code)
+}
+
+fn generate_function(program: &IrFunction) -> Result<FunctionCode, String> {
     if program.blocks.is_empty() || program.entry >= program.blocks.len() {
         return Err("invalid IR: missing entry block".into());
     }
+    // Frame layout, in 8-byte slots addressed as [rbp - 8*k]:
+    //   locals | register spills | phi staging | incoming register params | saved callee-saved regs
     let mut local_slots = HashMap::new();
-    let mut next_slot = 1i32;
-    for name in &program.locals {
-        if local_slots.insert(name.clone(), next_slot * 8).is_some() {
-            return Err(format!("duplicate IR local '{name}'"));
+    for (i, name) in program.locals.iter().enumerate() {
+        if local_slots.insert(name.clone(), (i as i32 + 1) * 8).is_some() {
+            return Err(format!("invalid IR: duplicate local '{name}'"));
         }
-        next_slot += 1;
     }
     let allocation = regalloc::allocate(program);
-    let spill_base = (next_slot - 1) * 8;
+    let spill_base = program.locals.len() as i32 * 8;
     let mut phi_stage_slots = HashMap::new();
     for block in &program.blocks {
         for instruction in &block.instructions {
@@ -25,8 +57,18 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
             }
         }
     }
-    let frame_slots = program.locals.len() + allocation.spill_count + phi_stage_slots.len();
+    let param_base = program.locals.len() + allocation.spill_count + phi_stage_slots.len();
+    let register_params = program.param_count.min(ARG_REGS.len());
+    let param_slots: Vec<i32> = (0..register_params).map(|i| (param_base + i + 1) as i32 * 8).collect();
+    let used_registers: Vec<u8> = ALLOCATABLE_REGISTERS.iter().copied()
+        .filter(|r| allocation.locations.iter().any(|l| *l == Location::Register(*r))).collect();
+    let saved_base = param_base + register_params;
+    let saved_regs: Vec<(u8, i32)> = used_registers.iter().enumerate()
+        .map(|(j, r)| (*r, (saved_base + j + 1) as i32 * 8)).collect();
+    let frame_slots = saved_base + saved_regs.len();
+    // Keep RSP 16-byte aligned after the prologue (it is 8 mod 16 on entry, 0 after push rbp).
     let frame = ((frame_slots * 8 + 15) / 16 * 16) as u32;
+
     // Phi assignments are edge-specific. Redirect only those edges through
     // tiny copy blocks so a conditional branch never executes the other edge's copies.
     let mut edge_trampolines = Vec::<(BlockId, BlockId)>::new();
@@ -53,15 +95,19 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
     let mut g = Generator {
         code: Vec::new(), local_slots, allocation, spill_base, phi_stage_slots,
         block_offsets: vec![usize::MAX; program.blocks.len() + edge_trampolines.len()],
-        patches: Vec::new(), edge_targets, current_block: program.entry,
+        patches: Vec::new(), calls: Vec::new(), edge_targets, current_block: program.entry,
+        param_slots, saved_regs,
     };
-    // Long-lived SSA values use allocated registers; excess values spill to stack.
-    // Phi copies are staged to preserve parallel-copy semantics.
+    // Prologue. Incoming argument registers are saved immediately because RCX/RDX
+    // are used as scratch registers by the code that follows.
     g.code.extend_from_slice(&[0x55, 0x48, 0x89, 0xe5]);
     if frame != 0 {
         g.code.extend_from_slice(&[0x48, 0x81, 0xec]);
         g.code.extend_from_slice(&frame.to_le_bytes());
     }
+    for (i, slot) in g.param_slots.clone().into_iter().enumerate() { g.store_reg(ARG_REGS[i], slot); }
+    for (reg, slot) in g.saved_regs.clone() { g.store_reg(reg, slot); }
+
     for block in &program.blocks {
         if block.id >= program.blocks.len() {
             return Err("invalid IR: block id out of range".into());
@@ -103,7 +149,7 @@ pub fn generate(program: &IrProgram) -> Result<Vec<u8>, String> {
             .map_err(|_| "branch displacement out of range")?;
         g.code[at..at + 4].copy_from_slice(&delta.to_le_bytes());
     }
-    Ok(g.code)
+    Ok(FunctionCode { code: g.code, calls: g.calls })
 }
 
 struct Generator {
@@ -114,8 +160,13 @@ struct Generator {
     phi_stage_slots: HashMap<ValueId, i32>,
     block_offsets: Vec<usize>,
     patches: Vec<(usize, BlockId)>,
+    calls: Vec<(usize, String)>,
     edge_targets: HashMap<(BlockId, BlockId), BlockId>,
     current_block: BlockId,
+    /// Frame slots holding the incoming register arguments (indices 0..=5).
+    param_slots: Vec<i32>,
+    /// Callee-saved registers this function uses, with the slot each is saved in.
+    saved_regs: Vec<(u8, i32)>,
 }
 impl Generator {
     fn local(&self, name: &str) -> Result<i32, String> {
@@ -127,26 +178,19 @@ impl Generator {
             .ok_or_else(|| format!("invalid IR: value %{id} out of range"))
     }
     fn spill_displacement(&self, slot: usize) -> i32 { self.spill_base + (slot as i32 + 1) * 8 }
-    fn load_value_rax(&mut self, id: ValueId) -> Result<(), String> {
+    /// mov dst, <value>, for any 64-bit register `dst` (0..=15).
+    fn load_value_into(&mut self, dst: u8, id: ValueId) -> Result<(), String> {
         match self.location(id)? {
-            Location::Spill(slot) => self.load_rax(self.spill_displacement(slot)),
+            Location::Spill(slot) => self.load_reg(dst, self.spill_displacement(slot)),
             Location::Register(reg) => {
-                let rex = 0x48 | if reg >= 8 { 0x04 } else { 0 };
-                self.code.extend_from_slice(&[rex, 0x89, 0xc0 | ((reg & 7) << 3)]);
+                let rex = 0x48 | if reg >= 8 { 0x04 } else { 0 } | if dst >= 8 { 0x01 } else { 0 };
+                self.code.extend_from_slice(&[rex, 0x89, 0xc0 | ((reg & 7) << 3) | (dst & 7)]);
             }
         }
         Ok(())
     }
-    fn load_value_rcx(&mut self, id: ValueId) -> Result<(), String> {
-        match self.location(id)? {
-            Location::Spill(slot) => self.load_rcx(self.spill_displacement(slot)),
-            Location::Register(reg) => {
-                let rex = 0x48 | if reg >= 8 { 0x04 } else { 0 };
-                self.code.extend_from_slice(&[rex, 0x89, 0xc1 | ((reg & 7) << 3)]);
-            }
-        }
-        Ok(())
-    }
+    fn load_value_rax(&mut self, id: ValueId) -> Result<(), String> { self.load_value_into(0, id) }
+    fn load_value_rcx(&mut self, id: ValueId) -> Result<(), String> { self.load_value_into(1, id) }
     fn store_rax_value(&mut self, id: ValueId) -> Result<(), String> {
         match self.location(id)? {
             Location::Spill(slot) => self.store_rax(self.spill_displacement(slot)),
@@ -157,23 +201,48 @@ impl Generator {
         }
         Ok(())
     }
-    fn load_rax(&mut self, displacement: i32) {
-        self.code.extend_from_slice(&[0x48, 0x8b, 0x85]);
+    /// mov [rbp - displacement], reg
+    fn store_reg(&mut self, reg: u8, displacement: i32) {
+        self.code.extend_from_slice(&[0x48 | if reg >= 8 { 0x04 } else { 0 }, 0x89, 0x85 | ((reg & 7) << 3)]);
         self.code.extend_from_slice(&(-displacement).to_le_bytes());
     }
-    fn load_rcx(&mut self, displacement: i32) {
-        self.code.extend_from_slice(&[0x48, 0x8b, 0x8d]);
+    /// mov reg, [rbp - displacement]  (a negative displacement addresses above RBP)
+    fn load_reg(&mut self, reg: u8, displacement: i32) {
+        self.code.extend_from_slice(&[0x48 | if reg >= 8 { 0x04 } else { 0 }, 0x8b, 0x85 | ((reg & 7) << 3)]);
         self.code.extend_from_slice(&(-displacement).to_le_bytes());
     }
-    fn store_rax(&mut self, displacement: i32) {
-        self.code.extend_from_slice(&[0x48, 0x89, 0x85]);
-        self.code.extend_from_slice(&(-displacement).to_le_bytes());
-    }
+    fn load_rax(&mut self, displacement: i32) { self.load_reg(0, displacement) }
+    fn store_rax(&mut self, displacement: i32) { self.store_reg(0, displacement) }
     fn jump(&mut self, opcode: &[u8], target: BlockId) {
         self.code.extend_from_slice(opcode);
         let at = self.code.len();
         self.code.extend_from_slice(&[0; 4]);
         self.patches.push((at, target));
+    }
+    /// Emit `call callee` with System V argument passing: the first six integer
+    /// arguments in registers, the rest pushed right-to-left, RSP 16-byte aligned
+    /// at the call, caller cleans up the stack, result in RAX.
+    fn call(&mut self, dst: ValueId, callee: &str, args: &[ValueId]) -> Result<(), String> {
+        let stack_args = args.len().saturating_sub(ARG_REGS.len());
+        let padding = stack_args % 2 == 1;
+        if padding { self.code.extend_from_slice(&[0x48, 0x83, 0xec, 0x08]); } // sub rsp, 8
+        for arg in args.iter().skip(ARG_REGS.len()).rev() {
+            self.load_value_rax(*arg)?;
+            self.code.push(0x50); // push rax
+        }
+        for (i, arg) in args.iter().take(ARG_REGS.len()).enumerate() {
+            self.load_value_into(ARG_REGS[i], *arg)?;
+        }
+        self.code.push(0xe8);
+        let at = self.code.len();
+        self.code.extend_from_slice(&[0; 4]);
+        self.calls.push((at, callee.to_string()));
+        let cleanup = (stack_args + usize::from(padding)) as u32 * 8;
+        if cleanup != 0 {
+            self.code.extend_from_slice(&[0x48, 0x81, 0xc4]); // add rsp, imm32
+            self.code.extend_from_slice(&cleanup.to_le_bytes());
+        }
+        self.store_rax_value(dst)
     }
     fn instruction(&mut self, inst: &Instruction) -> Result<(), String> {
         match inst {
@@ -185,6 +254,16 @@ impl Generator {
                 self.code.extend_from_slice(&value.to_le_bytes());
                 self.store_rax_value(*dst)?;
             }
+            Instruction::Param { dst, index } => {
+                if let Some(slot) = self.param_slots.get(*index).copied() {
+                    self.load_rax(slot);
+                } else {
+                    // Stack argument #6 is at [rbp + 16], #7 at [rbp + 24], ...
+                    self.load_rax(-(16 + 8 * (*index as i32 - ARG_REGS.len() as i32)));
+                }
+                self.store_rax_value(*dst)?;
+            }
+            Instruction::Call { dst, callee, args } => self.call(*dst, callee, args)?,
             Instruction::LoadLocal { dst, name } => {
                 self.load_rax(self.local(name)?);
                 self.store_rax_value(*dst)?;
@@ -255,8 +334,9 @@ impl Generator {
             }
             Terminator::Return(value) => {
                 self.load_value_rax(value)?;
-                // Linux x86-64 sys_exit(status), intentionally no libc dependency.
-                self.code.extend_from_slice(&[0x48, 0x89, 0xc7, 0xb8, 60, 0, 0, 0, 0x0f, 0x05]);
+                // Epilogue: restore callee-saved registers, then `mov rsp, rbp; pop rbp; ret`.
+                for (reg, slot) in self.saved_regs.clone() { self.load_reg(reg, slot); }
+                self.code.extend_from_slice(&[0x48, 0x89, 0xec, 0x5d, 0xc3]);
             }
         }
         Ok(())

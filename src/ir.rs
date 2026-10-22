@@ -1,10 +1,16 @@
-use crate::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, UnaryOp};
 
 pub type ValueId = usize;
 pub type BlockId = usize;
 
+/// A whole translation unit: every function with a body, in source order.
 #[derive(Debug, Clone, PartialEq)]
-pub struct IrProgram {
+pub struct IrModule { pub functions: Vec<IrFunction> }
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IrFunction {
+    pub name: String,
+    pub param_count: usize,
     pub locals: Vec<String>,
     pub value_count: usize,
     pub blocks: Vec<BasicBlock>,
@@ -21,6 +27,10 @@ pub struct BasicBlock {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instruction {
     Const { dst: ValueId, value: i64 },
+    /// The incoming argument number `index` (0-based), read once at function entry.
+    Param { dst: ValueId, index: usize },
+    /// Call `callee` with `args`; has side effects, so it is never removed as dead code.
+    Call { dst: ValueId, callee: String, args: Vec<ValueId> },
     LoadLocal { dst: ValueId, name: String },
     StoreLocal { name: String, src: ValueId },
     Unary { dst: ValueId, op: IrUnary, src: ValueId },
@@ -46,22 +56,41 @@ pub enum IrBinary {
     Equal, NotEqual, Less, LessEqual, Greater, GreaterEqual,
 }
 
-pub fn lower(program: &Program) -> IrProgram {
+pub fn lower(program: &Program) -> IrModule {
+    IrModule {
+        functions: program.functions.iter().filter(|f| f.body.is_some()).map(lower_function).collect(),
+    }
+}
+
+fn lower_function(function: &Function) -> IrFunction {
     let mut builder = Builder { locals: Vec::new(), value_count: 0, blocks: Vec::new(), current: 0 };
     builder.new_block();
-    for statement in &program.statements { builder.statement(statement); }
+    // Parameters become ordinary locals initialised from the incoming arguments.
+    for (index, name) in function.params.iter().enumerate() {
+        builder.locals.push(name.clone());
+        let dst = builder.value();
+        builder.emit(Instruction::Param { dst, index });
+        builder.emit(Instruction::StoreLocal { name: name.clone(), src: dst });
+    }
+    for statement in function.body.as_deref().unwrap_or(&[]) { builder.statement(statement); }
     if builder.blocks[builder.current].terminator.is_none() {
         let zero = builder.value();
         builder.emit(Instruction::Const { dst: zero, value: 0 });
         builder.terminate(Terminator::Return(zero));
     }
-    IrProgram { locals: builder.locals, value_count: builder.value_count, blocks: builder.blocks, entry: 0 }
+    IrFunction {
+        name: function.name.clone(), param_count: function.params.len(),
+        locals: builder.locals, value_count: builder.value_count, blocks: builder.blocks, entry: 0,
+    }
 }
-
 
 /// Promote local variables to SSA using dominators, dominance frontiers, and renaming.
 /// Existing expression-value phi nodes are preserved.
-pub fn promote_locals_to_ssa(program: &mut IrProgram) {
+pub fn promote_locals_to_ssa(module: &mut IrModule) {
+    for function in &mut module.functions { promote_function(function); }
+}
+
+fn promote_function(program: &mut IrFunction) {
     use std::collections::{HashMap, HashSet};
     let n = program.blocks.len();
     if n == 0 || program.entry >= n { return; }
@@ -158,7 +187,7 @@ pub fn promote_locals_to_ssa(program: &mut IrProgram) {
         value
     }
     fn rename_block(
-        b: BlockId, program: &mut IrProgram, children: &[Vec<BlockId>],
+        b: BlockId, program: &mut IrFunction, children: &[Vec<BlockId>],
         phi_vars: &HashMap<ValueId, String>, stacks: &mut HashMap<String, Vec<ValueId>>,
         aliases: &mut HashMap<ValueId, ValueId>, out_versions: &mut [HashMap<String, ValueId>],
     ) {
@@ -189,6 +218,10 @@ pub fn promote_locals_to_ssa(program: &mut IrProgram) {
                     pushed.push(name);
                 }
                 Instruction::Const { dst, value } => rewritten.push(Instruction::Const { dst, value }),
+                Instruction::Param { dst, index } => rewritten.push(Instruction::Param { dst, index }),
+                Instruction::Call { dst, callee, args } => rewritten.push(Instruction::Call {
+                    dst, callee, args: args.into_iter().map(|a| resolve(a, aliases)).collect(),
+                }),
                 Instruction::Unary { dst, op, src } =>
                     rewritten.push(Instruction::Unary { dst, op, src: resolve(src, aliases) }),
                 Instruction::Binary { dst, op, lhs, rhs } =>
@@ -248,7 +281,12 @@ pub fn promote_locals_to_ssa(program: &mut IrProgram) {
 
 /// Fold constants inside each basic block. Control-flow edges and short-circuit
 /// branches are explicit, so this pass never evaluates an untaken branch.
-pub fn optimize(mut program: IrProgram) -> IrProgram {
+pub fn optimize(mut module: IrModule) -> IrModule {
+    module.functions = module.functions.into_iter().map(optimize_function).collect();
+    module
+}
+
+fn optimize_function(mut program: IrFunction) -> IrFunction {
     for block in &mut program.blocks {
         let mut constants = std::collections::HashMap::<ValueId, i64>::new();
         for inst in &mut block.instructions {
@@ -276,7 +314,8 @@ pub fn optimize(mut program: IrProgram) -> IrProgram {
                         *inst = Instruction::Const { dst, value }; constants.insert(dst, value);
                     } else { constants.remove(&dst); }
                 }
-                Instruction::LoadLocal { dst, .. } | Instruction::Phi { dst, .. } => { constants.remove(&dst); }
+                Instruction::LoadLocal { dst, .. } | Instruction::Phi { dst, .. }
+                | Instruction::Param { dst, .. } | Instruction::Call { dst, .. } => { constants.remove(&dst); }
                 Instruction::StoreLocal { .. } => {}
             }
         }
@@ -292,7 +331,7 @@ pub fn optimize(mut program: IrProgram) -> IrProgram {
     program
 }
 
-fn simplify_constant_branches(program: &mut IrProgram) {
+fn simplify_constant_branches(program: &mut IrFunction) {
     for block in &mut program.blocks {
         let mut constants = std::collections::HashMap::<ValueId, i64>::new();
         for inst in &block.instructions {
@@ -312,7 +351,8 @@ fn simplify_constant_branches(program: &mut IrProgram) {
                 Instruction::ToBool { dst, src } => {
                     if let Some(n) = constants.get(src).copied() { constants.insert(*dst, i64::from(n != 0)); }
                 }
-                Instruction::LoadLocal { dst, .. } | Instruction::Phi { dst, .. } => { constants.remove(dst); }
+                Instruction::LoadLocal { dst, .. } | Instruction::Phi { dst, .. }
+                | Instruction::Param { dst, .. } | Instruction::Call { dst, .. } => { constants.remove(dst); }
                 Instruction::StoreLocal { .. } => {}
             }
         }
@@ -324,7 +364,7 @@ fn simplify_constant_branches(program: &mut IrProgram) {
     }
 }
 
-fn remove_unreachable_blocks(program: &mut IrProgram) {
+fn remove_unreachable_blocks(program: &mut IrFunction) {
     if program.blocks.is_empty() || program.entry >= program.blocks.len() { return; }
     let mut reachable = vec![false; program.blocks.len()];
     let mut worklist = vec![program.entry];
@@ -367,13 +407,16 @@ fn remove_unreachable_blocks(program: &mut IrProgram) {
     program.blocks = blocks;
 }
 
-fn eliminate_dead_values(program: &mut IrProgram) {
+fn eliminate_dead_values(program: &mut IrFunction) {
     loop {
         let mut uses = vec![0usize; program.value_count];
         for block in &program.blocks {
             for inst in &block.instructions {
                 match inst {
-                    Instruction::LoadLocal { .. } | Instruction::Const { .. } => {}
+                    Instruction::LoadLocal { .. } | Instruction::Const { .. } | Instruction::Param { .. } => {}
+                    Instruction::Call { args, .. } => {
+                        for value in args { if let Some(n) = uses.get_mut(*value) { *n += 1; } }
+                    }
                     Instruction::Phi { incoming, .. } => {
                         for (_, value) in incoming { if let Some(n) = uses.get_mut(*value) { *n += 1; } }
                     }
@@ -399,8 +442,9 @@ fn eliminate_dead_values(program: &mut IrProgram) {
         let before: usize = program.blocks.iter().map(|b| b.instructions.len()).sum();
         for block in &mut program.blocks {
             block.instructions.retain(|inst| match inst {
-                Instruction::StoreLocal { .. } => true,
-                Instruction::Const { dst, .. } | Instruction::LoadLocal { dst, .. } |
+                // Stores and calls have side effects and are always kept.
+                Instruction::StoreLocal { .. } | Instruction::Call { .. } => true,
+                Instruction::Const { dst, .. } | Instruction::LoadLocal { dst, .. } | Instruction::Param { dst, .. } |
                 Instruction::Unary { dst, .. } | Instruction::Binary { dst, .. } |
                 Instruction::ToBool { dst, .. } | Instruction::Phi { dst, .. } => uses.get(*dst).copied().unwrap_or(0) != 0,
             });
@@ -466,6 +510,7 @@ impl Builder {
             Stmt::Return(e) => {
                 let value = self.expression(e); self.terminate(Terminator::Return(value));
             }
+            Stmt::Expr(e) => { self.expression(e); }
             Stmt::Block(body) => for statement in body { self.statement(statement); },
             Stmt::If { condition, then_branch, else_branch } => {
                 let condition = self.expression(condition);
@@ -505,6 +550,13 @@ impl Builder {
                     UnaryOp::BitNot => IrUnary::BitNot, UnaryOp::LogicalNot => IrUnary::LogicalNot,
                 };
                 self.emit(Instruction::Unary { dst, op, src }); dst
+            }
+            Expr::Call { name, args } => {
+                let mut values = Vec::with_capacity(args.len());
+                for arg in args { values.push(self.expression(arg)); }
+                let dst = self.value();
+                self.emit(Instruction::Call { dst, callee: name.clone(), args: values });
+                dst
             }
             Expr::Binary { op: BinaryOp::LogicalAnd, left, right } => self.logical(left, right, true),
             Expr::Binary { op: BinaryOp::LogicalOr, left, right } => self.logical(left, right, false),
@@ -553,9 +605,20 @@ impl Builder {
 mod tests {
     use super::*;
     use crate::{lexer::lex, parser::Parser, sema};
-    fn lower_source(source: &str) -> IrProgram {
+    /// Lower and optimise a program, returning its first function.
+    fn lower_source(source: &str) -> IrFunction {
         let ast = Parser::new(lex(source).unwrap()).parse().unwrap();
-        optimize(lower(&sema::analyze(&ast).unwrap()))
+        optimize(lower(&sema::analyze(&ast).unwrap())).functions.remove(0)
+    }
+    fn lower_raw(source: &str) -> IrFunction {
+        let ast = Parser::new(lex(source).unwrap()).parse().unwrap();
+        lower(&sema::analyze(&ast).unwrap()).functions.remove(0)
+    }
+    fn promoted(source: &str) -> IrFunction {
+        let ast = Parser::new(lex(source).unwrap()).parse().unwrap();
+        let mut m = lower(&sema::analyze(&ast).unwrap());
+        promote_locals_to_ssa(&mut m);
+        m.functions.remove(0)
     }
     #[test]
     fn produces_explicit_blocks_and_terminators() {
@@ -579,8 +642,7 @@ mod tests {
     }
     #[test]
     fn short_circuit_result_uses_phi_node() {
-        let ast = Parser::new(lex("int main(){int x=2;return x && 3;}").unwrap()).parse().unwrap();
-        let p = lower(&sema::analyze(&ast).unwrap());
+        let p = lower_raw("int main(){int x=2;return x && 3;}");
         assert!(p.blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Phi { incoming, .. } if incoming.len() == 2)));
     }
     #[test]
@@ -591,9 +653,7 @@ mod tests {
 
     #[test]
     fn promotes_branch_assigned_local_to_ssa_phi() {
-        let ast = Parser::new(lex("int main(){int x=1;if(x<2)x=x+3;else x=x+4;return x;}").unwrap()).parse().unwrap();
-        let mut p = lower(&sema::analyze(&ast).unwrap());
-        promote_locals_to_ssa(&mut p);
+        let p = promoted("int main(){int x=1;if(x<2)x=x+3;else x=x+4;return x;}");
         assert!(!p.blocks.iter().flat_map(|b| &b.instructions).any(|i|
             matches!(i, Instruction::LoadLocal { .. } | Instruction::StoreLocal { .. })));
         assert!(p.blocks.iter().flat_map(|b| &b.instructions).any(|i|
@@ -602,12 +662,37 @@ mod tests {
 
     #[test]
     fn promotes_loop_carried_local_to_ssa_phi() {
-        let ast = Parser::new(lex("int main(){int x=0;while(x<5)x=x+1;return x;}").unwrap()).parse().unwrap();
-        let mut p = lower(&sema::analyze(&ast).unwrap());
-        promote_locals_to_ssa(&mut p);
+        let p = promoted("int main(){int x=0;while(x<5)x=x+1;return x;}");
         assert!(!p.blocks.iter().flat_map(|b| &b.instructions).any(|i|
             matches!(i, Instruction::LoadLocal { .. } | Instruction::StoreLocal { .. })));
         assert!(p.blocks.iter().flat_map(|b| &b.instructions).any(|i|
             matches!(i, Instruction::Phi { incoming, .. } if incoming.len() >= 2)));
+    }
+
+    #[test]
+    fn lowers_params_and_calls() {
+        let ast = Parser::new(lex("int f(int a,int b){return a+b;} int main(){return f(1,2);}").unwrap()).parse().unwrap();
+        let m = optimize(lower(&sema::analyze(&ast).unwrap()));
+        assert_eq!(m.functions.len(), 2);
+        assert_eq!(m.functions[0].param_count, 2);
+        let main = &m.functions[1];
+        assert!(main.blocks.iter().flat_map(|b| &b.instructions)
+            .any(|i| matches!(i, Instruction::Call { callee, args, .. } if callee == "f" && args.len() == 2)));
+    }
+    #[test]
+    fn unused_call_result_is_not_eliminated() {
+        let ast = Parser::new(lex("int f(int a){return a;} int main(){f(1);return 0;}").unwrap()).parse().unwrap();
+        let m = optimize(lower(&sema::analyze(&ast).unwrap()));
+        assert!(m.functions[1].blocks.iter().flat_map(|b| &b.instructions).any(|i| matches!(i, Instruction::Call { .. })));
+    }
+    #[test]
+    fn unused_params_are_dead_but_used_ones_survive() {
+        let ast = Parser::new(lex("int f(int a,int b){return b;} int main(){return f(1,2);}").unwrap()).parse().unwrap();
+        let mut m = lower(&sema::analyze(&ast).unwrap());
+        promote_locals_to_ssa(&mut m);
+        let m = optimize(m);
+        let params: Vec<usize> = m.functions[0].blocks.iter().flat_map(|b| &b.instructions)
+            .filter_map(|i| if let Instruction::Param { index, .. } = i { Some(*index) } else { None }).collect();
+        assert_eq!(params, vec![1]);
     }
 }

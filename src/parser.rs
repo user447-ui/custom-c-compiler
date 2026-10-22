@@ -1,4 +1,4 @@
-use crate::ast::{BinaryOp, Expr, Program, Stmt, UnaryOp};
+use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, UnaryOp};
 use crate::lexer::{Token, TokenKind};
 
 pub struct Parser { tokens: Vec<Token>, pos: usize }
@@ -14,14 +14,33 @@ impl Parser {
         let t=self.take(); if t.kind==TokenKind::Ident(s.into()) { Ok(()) } else { Err(format!("at character {}: expected {s}, got {:?}",t.offset,t.kind)) }
     }
     fn name(&mut self) -> Result<String, String> {
-        let t=self.take(); if let TokenKind::Ident(s)=t.kind { Ok(s) } else { Err(format!("at character {}: expected identifier, got {:?}",t.offset,t.kind)) }
+        let t=self.take();
+        match t.kind {
+            TokenKind::Ident(s) if is_keyword(&s) => Err(format!("at character {}: '{s}' is a keyword and cannot be used as a name",t.offset)),
+            TokenKind::Ident(s) => Ok(s),
+            other => Err(format!("at character {}: expected identifier, got {other:?}",t.offset)),
+        }
     }
     pub fn parse(mut self) -> Result<Program, String> {
-        self.ident("int")?; self.ident("main")?; self.expect(TokenKind::LParen)?;
-        if *self.peek()==TokenKind::Ident("void".into()) { self.take(); }
-        self.expect(TokenKind::RParen)?; let statements=self.block()?;
-        if *self.peek()!=TokenKind::End { return Err(format!("unexpected trailing token {:?}",self.peek())); }
-        Ok(Program { statements })
+        let mut functions = Vec::new();
+        while *self.peek() != TokenKind::End { functions.push(self.function()?); }
+        Ok(Program { functions })
+    }
+    /// `int name(int a, int b) { ... }` or a prototype `int name(int a, int b);`.
+    fn function(&mut self) -> Result<Function, String> {
+        self.ident("int")?; let name=self.name()?; self.expect(TokenKind::LParen)?;
+        let mut params=Vec::new();
+        if *self.peek()==TokenKind::Ident("void".into()) && *self.peek2()==TokenKind::RParen {
+            self.take();
+        } else if *self.peek()!=TokenKind::RParen {
+            loop {
+                self.ident("int")?; params.push(self.name()?);
+                if *self.peek()==TokenKind::Comma { self.take(); } else { break; }
+            }
+        }
+        self.expect(TokenKind::RParen)?;
+        let body = if *self.peek()==TokenKind::Semicolon { self.take(); None } else { Some(self.block()?) };
+        Ok(Function { name, params, body })
     }
     fn block(&mut self) -> Result<Vec<Stmt>, String> {
         self.expect(TokenKind::LBrace)?; let mut v=Vec::new();
@@ -54,6 +73,11 @@ impl Parser {
                 let name=self.name()?; self.expect(TokenKind::Equal)?; let value=self.expr(0)?; self.expect(TokenKind::Semicolon)?;
                 Ok(Stmt::Assignment { name, value })
             }
+            TokenKind::Semicolon => { self.take(); Ok(Stmt::Block(Vec::new())) }
+            TokenKind::Ident(_) | TokenKind::Number(_) | TokenKind::LParen | TokenKind::Plus
+            | TokenKind::Minus | TokenKind::Tilde | TokenKind::Bang => {
+                let e=self.expr(0)?; self.expect(TokenKind::Semicolon)?; Ok(Stmt::Expr(e))
+            }
             x => Err(format!("unexpected token at statement start: {x:?}")),
         }
     }
@@ -61,6 +85,19 @@ impl Parser {
         let t=self.take();
         let mut lhs=match t.kind {
             TokenKind::Number(n)=>Expr::Number(n),
+            TokenKind::Ident(s) if is_keyword(&s) =>
+                return Err(format!("at character {}: unexpected keyword '{s}' in expression",t.offset)),
+            TokenKind::Ident(s) if *self.peek()==TokenKind::LParen => {
+                self.take(); let mut args=Vec::new();
+                if *self.peek()!=TokenKind::RParen {
+                    loop {
+                        args.push(self.expr(0)?);
+                        if *self.peek()==TokenKind::Comma { self.take(); } else { break; }
+                    }
+                }
+                self.expect(TokenKind::RParen)?;
+                Expr::Call { name: s, args }
+            }
             TokenKind::Ident(s)=>Expr::Variable(s),
             TokenKind::LParen=>{let e=self.expr(0)?;self.expect(TokenKind::RParen)?;e},
             TokenKind::Plus=>Expr::Unary{op:UnaryOp::Plus,expr:Box::new(self.expr(19)?)},
@@ -95,10 +132,35 @@ impl Parser {
         Ok(lhs)
     }
 }
+fn is_keyword(s: &str) -> bool { matches!(s, "int" | "void" | "return" | "if" | "else" | "while") }
+
 #[cfg(test)]
 mod tests {
     use super::*; use crate::lexer::lex;
-    #[test] fn parses_statements() { let p=Parser::new(lex("int main(){int x=1;while(x-5)x=x+1;return x;}").unwrap()).parse().unwrap(); assert_eq!(p.statements.len(),3); }
-    #[test] fn parses_precedence() { let p=Parser::new(lex("int main(){return 1+2<4 && !0;}").unwrap()).parse().unwrap(); assert_eq!(p.statements.len(),1); }
-    #[test] fn rejects_missing_semicolon() { assert!(Parser::new(lex("int main(){return 1}").unwrap()).parse().is_err()); }
+    fn parse(src: &str) -> Result<Program, String> { Parser::new(lex(src).unwrap()).parse() }
+    fn main_body(p: &Program) -> &Vec<Stmt> { p.functions[0].body.as_ref().unwrap() }
+    #[test] fn parses_statements() { let p=parse("int main(){int x=1;while(x-5)x=x+1;return x;}").unwrap(); assert_eq!(main_body(&p).len(),3); }
+    #[test] fn parses_precedence() { let p=parse("int main(){return 1+2<4 && !0;}").unwrap(); assert_eq!(main_body(&p).len(),1); }
+    #[test] fn rejects_missing_semicolon() { assert!(parse("int main(){return 1}").is_err()); }
+    #[test] fn parses_multiple_functions_and_params() {
+        let p=parse("int add(int a, int b){return a+b;} int main(void){return add(1,2);}").unwrap();
+        assert_eq!(p.functions.len(),2);
+        assert_eq!(p.functions[0].params, vec!["a","b"]);
+    }
+    #[test] fn parses_prototype_and_void_params() {
+        let p=parse("int f(void); int g(); int f(void){return 1;}").unwrap();
+        assert!(p.functions[0].body.is_none() && p.functions[1].body.is_none() && p.functions[2].body.is_some());
+        assert!(p.functions[0].params.is_empty() && p.functions[1].params.is_empty());
+    }
+    #[test] fn parses_call_statement_and_nested_calls() {
+        let p=parse("int main(){f(g(1),2);return 0;}").unwrap();
+        assert!(matches!(&main_body(&p)[0], Stmt::Expr(Expr::Call{args,..}) if args.len()==2));
+    }
+    #[test] fn parses_empty_statement() { assert!(parse("int main(){;return 0;}").is_ok()); }
+    #[test] fn rejects_keyword_names() {
+        assert!(parse("int main(){int return=1;return 0;}").is_err());
+        assert!(parse("int main(int while){return 0;}").is_err());
+        assert!(parse("int main(){else;}").is_err());
+    }
+    #[test] fn rejects_trailing_comma_in_params() { assert!(parse("int f(int a,){return a;}").is_err()); }
 }

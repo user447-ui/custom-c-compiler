@@ -1,7 +1,7 @@
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Ident(String), Number(i64),
-    LParen, RParen, LBrace, RBrace, Semicolon,
+    LParen, RParen, LBrace, RBrace, Semicolon, Comma,
     Equal, EqualEqual, Bang, BangEqual,
     Less, LessEqual, Greater, GreaterEqual,
     Amp, AmpAmp, Pipe, PipePipe, Caret, Tilde,
@@ -54,7 +54,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
         if let Some(kind) = two { out.push(Token { kind, offset: start }); i += 2; continue; }
         let kind = match x {
             '(' => TokenKind::LParen, ')' => TokenKind::RParen,
-            '{' => TokenKind::LBrace, '}' => TokenKind::RBrace, ';' => TokenKind::Semicolon,
+            '{' => TokenKind::LBrace, '}' => TokenKind::RBrace, ';' => TokenKind::Semicolon, ',' => TokenKind::Comma,
             '=' => TokenKind::Equal, '!' => TokenKind::Bang,
             '<' => TokenKind::Less, '>' => TokenKind::Greater,
             '&' => TokenKind::Amp, '|' => TokenKind::Pipe, '^' => TokenKind::Caret, '~' => TokenKind::Tilde,
@@ -71,5 +71,6 @@ mod tests {
     use super::*;
     #[test] fn comments_and_assignment() { assert!(lex("int x=1; // ok\n").unwrap().iter().any(|t| t.kind == TokenKind::Equal)); }
     #[test] fn comparison_tokens() { let t=lex("a<=b && a!=0 || !b").unwrap(); assert!(t.iter().any(|x|x.kind==TokenKind::LessEqual)); assert!(t.iter().any(|x|x.kind==TokenKind::AmpAmp)); assert!(t.iter().any(|x|x.kind==TokenKind::Bang)); }
+    #[test] fn comma_token() { assert!(lex("f(a,b)").unwrap().iter().any(|t| t.kind == TokenKind::Comma)); }
     #[test] fn bad_comment() { assert!(lex("/*").is_err()); }
 }

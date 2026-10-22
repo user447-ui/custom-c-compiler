@@ -1,6 +1,6 @@
 [package]
 name = "custom-c-compiler"
-version = "0.12.0"
+version = "0.13.0"
 edition = "2024"
 description = "Experimental C/C++ compiler with a native Rust x86-64 ELF backend"
 license = "MIT"

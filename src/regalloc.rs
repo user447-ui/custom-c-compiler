@@ -1,7 +1,8 @@
-use crate::ir::{Instruction, IrProgram, Terminator, ValueId};
+use crate::ir::{Instruction, IrFunction, Terminator, ValueId};
 
-/// Physical registers used for long-lived virtual values. The generated program
-/// is a standalone Linux process, so no caller-preserved ABI state is required.
+/// Physical registers used for long-lived virtual values. All of them are
+/// callee-saved in the System V ABI, so values living in them survive calls; each
+/// function saves and restores the ones it actually uses.
 pub const ALLOCATABLE_REGISTERS: [u8; 5] = [3, 12, 13, 14, 15]; // RBX, R12-R15
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,7 +18,7 @@ pub struct Allocation {
 #[derive(Debug, Clone, Copy)]
 struct Interval { value: ValueId, start: usize, end: usize }
 
-pub fn allocate(program: &IrProgram) -> Allocation {
+pub fn allocate(program: &IrFunction) -> Allocation {
     let mut intervals = vec![None::<(usize, usize)>; program.value_count];
     let mut positions = vec![0usize; program.blocks.len()];
     let mut pos = 0usize;
@@ -104,7 +105,7 @@ fn successors(term: Option<Terminator>) -> Vec<usize> {
 
 /// Classic backward dataflow: live_in[b] = use[b] U (live_out[b] - def[b]),
 /// live_out[b] = U live_in[succ] U (phi operands flowing out of b).
-fn liveness(program: &IrProgram, phi_edge_uses: &[Vec<ValueId>]) -> (Vec<std::collections::HashSet<ValueId>>, Vec<std::collections::HashSet<ValueId>>) {
+fn liveness(program: &IrFunction, phi_edge_uses: &[Vec<ValueId>]) -> (Vec<std::collections::HashSet<ValueId>>, Vec<std::collections::HashSet<ValueId>>) {
     use std::collections::HashSet;
     let n = program.blocks.len();
     let mut uses_b = vec![HashSet::<ValueId>::new(); n];
@@ -152,6 +153,7 @@ fn touch(intervals: &mut [Option<(usize, usize)>], value: ValueId, position: usi
 fn definition(inst: &Instruction) -> Option<ValueId> {
     match inst {
         Instruction::Const { dst, .. } | Instruction::LoadLocal { dst, .. }
+        | Instruction::Param { dst, .. } | Instruction::Call { dst, .. }
         | Instruction::Unary { dst, .. } | Instruction::Binary { dst, .. }
         | Instruction::ToBool { dst, .. } | Instruction::Phi { dst, .. } => Some(*dst),
         Instruction::StoreLocal { .. } => None,
@@ -162,7 +164,9 @@ fn uses(inst: &Instruction) -> Vec<ValueId> {
         Instruction::Unary { src, .. } | Instruction::ToBool { src, .. } => vec![*src],
         Instruction::Binary { lhs, rhs, .. } => vec![*lhs, *rhs],
         Instruction::StoreLocal { src, .. } => vec![*src],
-        Instruction::Phi { .. } | Instruction::Const { .. } | Instruction::LoadLocal { .. } => Vec::new(),
+        Instruction::Call { args, .. } => args.clone(),
+        Instruction::Phi { .. } | Instruction::Const { .. } | Instruction::LoadLocal { .. }
+        | Instruction::Param { .. } => Vec::new(),
     }
 }
 
@@ -173,8 +177,9 @@ mod tests {
     #[test]
     fn assigns_registers_and_tracks_live_ranges() {
         let ast = Parser::new(lex("int main(){int x=1;int y=2;int z=3;return x+y+z;}").unwrap()).parse().unwrap();
-        let mut p = ir::lower(&sema::analyze(&ast).unwrap());
-        ir::promote_locals_to_ssa(&mut p);
+        let mut m = ir::lower(&sema::analyze(&ast).unwrap());
+        ir::promote_locals_to_ssa(&mut m);
+        let p = m.functions.remove(0);
         let a = allocate(&p);
         assert!(a.locations.iter().any(|l| matches!(l, Location::Register(_))));
         assert!(a.intervals.iter().any(Option::is_some));
