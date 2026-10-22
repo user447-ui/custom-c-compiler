@@ -37,6 +37,7 @@ pub fn allocate(program: &IrProgram) -> Allocation {
         pos += 2;
     }
     // Phi operands are uses on incoming edges, not at the phi's block entry.
+    let mut phi_edge_uses = vec![Vec::<ValueId>::new(); program.blocks.len()];
     for block in &program.blocks {
         for inst in &block.instructions {
             if let Instruction::Phi { incoming, .. } = inst {
@@ -44,9 +45,19 @@ pub fn allocate(program: &IrProgram) -> Allocation {
                     let edge_pos = positions.get(*pred).copied().unwrap_or(0)
                         + program.blocks.get(*pred).map(|b| b.instructions.len() * 2 + 1).unwrap_or(0);
                     touch(&mut intervals, *value, edge_pos);
+                    if let Some(v) = phi_edge_uses.get_mut(*pred) { v.push(*value); }
                 }
             }
         }
+    }
+    // A value that is live across a loop back-edge must stay allocated for the
+    // whole loop, so extend intervals using real block-level liveness.
+    let (live_in, live_out) = liveness(program, &phi_edge_uses);
+    for block in &program.blocks {
+        let start = positions[block.id];
+        let end = start + block.instructions.len() * 2 + 1;
+        for v in &live_in[block.id] { touch(&mut intervals, *v, start); }
+        for v in &live_out[block.id] { touch(&mut intervals, *v, end); }
     }
     let mut ordered: Vec<Interval> = intervals.iter().enumerate().filter_map(|(value, range)|
         range.map(|(start, end)| Interval { value, start, end })).collect();
@@ -81,6 +92,53 @@ pub fn allocate(program: &IrProgram) -> Allocation {
         }
     }
     Allocation { locations, spill_count, intervals }
+}
+
+fn successors(term: Option<Terminator>) -> Vec<usize> {
+    match term {
+        Some(Terminator::Jump(t)) => vec![t],
+        Some(Terminator::Branch { if_zero, if_nonzero, .. }) => vec![if_zero, if_nonzero],
+        _ => Vec::new(),
+    }
+}
+
+/// Classic backward dataflow: live_in[b] = use[b] U (live_out[b] - def[b]),
+/// live_out[b] = U live_in[succ] U (phi operands flowing out of b).
+fn liveness(program: &IrProgram, phi_edge_uses: &[Vec<ValueId>]) -> (Vec<std::collections::HashSet<ValueId>>, Vec<std::collections::HashSet<ValueId>>) {
+    use std::collections::HashSet;
+    let n = program.blocks.len();
+    let mut uses_b = vec![HashSet::<ValueId>::new(); n];
+    let mut defs_b = vec![HashSet::<ValueId>::new(); n];
+    for block in &program.blocks {
+        let b = block.id;
+        for inst in &block.instructions {
+            if !matches!(inst, Instruction::Phi { .. }) {
+                for u in uses(inst) { if !defs_b[b].contains(&u) { uses_b[b].insert(u); } }
+            }
+            if let Some(d) = definition(inst) { defs_b[b].insert(d); }
+        }
+        match block.terminator {
+            Some(Terminator::Branch { condition, .. }) | Some(Terminator::Return(condition)) =>
+                if !defs_b[b].contains(&condition) { uses_b[b].insert(condition); },
+            _ => {}
+        }
+    }
+    let mut live_in = vec![HashSet::<ValueId>::new(); n];
+    let mut live_out = vec![HashSet::<ValueId>::new(); n];
+    loop {
+        let mut changed = false;
+        for block in program.blocks.iter().rev() {
+            let b = block.id;
+            let mut out: HashSet<ValueId> = phi_edge_uses[b].iter().copied().collect();
+            for s in successors(block.terminator) { if s < n { out.extend(live_in[s].iter().copied()); } }
+            let mut inn = uses_b[b].clone();
+            inn.extend(out.iter().copied().filter(|v| !defs_b[b].contains(v)));
+            if out != live_out[b] { live_out[b] = out; changed = true; }
+            if inn != live_in[b] { live_in[b] = inn; changed = true; }
+        }
+        if !changed { break; }
+    }
+    (live_in, live_out)
 }
 
 fn touch(intervals: &mut [Option<(usize, usize)>], value: ValueId, position: usize) {

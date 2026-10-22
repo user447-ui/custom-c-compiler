@@ -536,11 +536,14 @@ impl Builder {
         let rhs = self.expression(right);
         let rhs_value = self.value();
         self.emit(Instruction::ToBool { dst: rhs_value, src: rhs });
+        // The RHS may itself contain control flow (nested && / ||), so the block that
+        // actually jumps to the merge is the *current* one, not `rhs_block`.
+        let rhs_end_block = self.current;
         self.terminate(Terminator::Jump(merge_block));
         self.current = merge_block;
         self.emit(Instruction::Phi {
             dst: result,
-            incoming: vec![(short_block, short_value), (rhs_block, rhs_value)],
+            incoming: vec![(short_block, short_value), (rhs_end_block, rhs_value)],
         });
         result
     }
