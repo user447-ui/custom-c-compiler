@@ -250,3 +250,26 @@ fn command_line_errors_are_reported_with_usage() {
     assert!(ok && out.starts_with("ccc 0.14.0"));
     let _ = fs::remove_file(src);
 }
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn compiler_output_is_reproducible() {
+    // Separate processes get different hash seeds; the output must not notice.
+    // `gcd` is a program whose generated code varied from run to run before phi
+    // creation order was made deterministic.
+    let source = GCD;
+    let src = temp_source("repro", source);
+    let out = src.with_extension("out");
+    let mut first: Option<Vec<u8>> = None;
+    for round in 0..16 {
+        let (ok, _, err) = run_ccc(&["-o", out.to_str().unwrap(), src.to_str().unwrap()]);
+        assert!(ok, "{err}");
+        let bytes = fs::read(&out).unwrap();
+        match &first {
+            None => first = Some(bytes),
+            Some(expected) => assert!(&bytes == expected, "output of run {round} differs from run 0"),
+        }
+    }
+    let _ = fs::remove_file(src);
+    let _ = fs::remove_file(out);
+}

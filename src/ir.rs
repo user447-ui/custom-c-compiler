@@ -93,7 +93,7 @@ pub fn promote_locals_to_ssa(module: &mut IrModule) {
 }
 
 fn promote_function(program: &mut IrFunction) {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     let n = program.blocks.len();
     if n == 0 || program.entry >= n { return; }
     fn successors(block: &BasicBlock) -> Vec<BlockId> {
@@ -142,7 +142,9 @@ fn promote_function(program: &mut IrFunction) {
     }
     let mut children = vec![Vec::<BlockId>::new(); n];
     for b in 0..n { if let Some(parent) = idom[b] { children[parent].push(b); } }
-    let mut frontier = vec![HashSet::<BlockId>::new(); n];
+    // Ordered collections: the order phi nodes are created in decides value numbers and the
+    // generated code, so it must not depend on per-process hash seeds.
+    let mut frontier = vec![BTreeSet::<BlockId>::new(); n];
     for b in 0..n {
         if !reachable[b] || preds[b].iter().filter(|p| reachable[**p]).count() < 2 { continue; }
         for pred in preds[b].iter().copied().filter(|p| reachable[*p]) {
@@ -154,7 +156,7 @@ fn promote_function(program: &mut IrFunction) {
             }
         }
     }
-    let mut definitions = HashMap::<String, HashSet<BlockId>>::new();
+    let mut definitions = BTreeMap::<String, BTreeSet<BlockId>>::new();
     for block in &program.blocks {
         if reachable[block.id] {
             for inst in &block.instructions {
@@ -703,5 +705,16 @@ mod tests {
         let params: Vec<usize> = m.functions[0].blocks.iter().flat_map(|b| &b.instructions)
             .filter_map(|i| if let Instruction::Param { index, .. } = i { Some(*index) } else { None }).collect();
         assert_eq!(params, vec![1]);
+    }
+
+    #[test]
+    fn ssa_construction_is_deterministic() {
+        // Several variables changed on different paths and in a loop produce many phi
+        // nodes; their creation order must not depend on hash seeds (each hash map
+        // instance gets its own seed, so repeating in one process is enough to notice).
+        let source = "int main(void){int a=1;int b=2;int c=3;int d=4;int e=5;int i=0; \
+            while(i<5){ if(i<2){a=a+b;b=b+c;} else {c=c+d;d=d+e;e=e+a;} i=i+1;} return a+b+c+d+e;}";
+        let first = promoted(source);
+        for round in 0..40 { assert_eq!(promoted(source), first, "round {round} differs"); }
     }
 }
