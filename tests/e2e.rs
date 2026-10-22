@@ -247,7 +247,7 @@ fn command_line_errors_are_reported_with_usage() {
         assert!(!ok && err.contains(expected) && err.contains("usage: ccc"), "{args:?}: {err}");
     }
     let (ok, out, _) = run_ccc(&["--version"]);
-    assert!(ok && out.starts_with("ccc 0.14.0"));
+    assert!(ok && out.starts_with(&format!("ccc {} (x86_64-linux-gnu)", env!("CARGO_PKG_VERSION"))), "{out}");
     let _ = fs::remove_file(src);
 }
 
@@ -269,6 +269,26 @@ fn compiler_output_is_reproducible() {
             None => first = Some(bytes),
             Some(expected) => assert!(&bytes == expected, "output of run {round} differs from run 0"),
         }
+    }
+    let _ = fs::remove_file(src);
+    let _ = fs::remove_file(out);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn target_option_selects_the_backend_or_explains_what_is_supported() {
+    let src = temp_source("target", GCD);
+    let path = src.to_str().unwrap();
+    let out = src.with_extension("out");
+    for spelling in ["--target=x86_64-linux", "--target=x86_64-linux-gnu", "--target=x86_64-unknown-linux-gnu"] {
+        let (ok, _, err) = run_ccc(&[spelling, "-o", out.to_str().unwrap(), path]);
+        assert!(ok, "{spelling}: {err}");
+        assert!(err.contains("x86-64 ELF executable"), "{err}");
+        assert_eq!(Command::new(&out).status().unwrap().code(), Some(12));
+    }
+    for (target, expected) in [("aarch64-linux", "unsupported architecture 'aarch64'"), ("x86_64-windows", "unsupported operating system 'windows'")] {
+        let (ok, _, err) = run_ccc(&[&format!("--target={target}"), "-o", out.to_str().unwrap(), path]);
+        assert!(!ok && err.contains(expected) && err.contains("supported targets: x86_64-linux"), "{target}: {err}");
     }
     let _ = fs::remove_file(src);
     let _ = fs::remove_file(out);

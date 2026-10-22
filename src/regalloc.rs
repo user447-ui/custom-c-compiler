@@ -1,19 +1,15 @@
+//! Linear-scan register allocation over block-level liveness.
+//!
+//! The allocator is target independent: the backend supplies the list of
+//! registers it may hand out (as opaque numbers) and interprets the result.
+
 use crate::ir::{Instruction, IrFunction, Terminator, ValueId};
 
-/// Physical registers used for long-lived virtual values. All of them are
-/// callee-saved in the System V ABI, so values living in them survive calls; each
-/// function saves and restores the ones it actually uses.
-/// Assembly name of an x86-64 general-purpose register number (0 = rax ... 15 = r15).
-pub fn register_name(reg: u8) -> &'static str {
-    const NAMES: [&str; 16] = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
-        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
-    NAMES.get(reg as usize).copied().unwrap_or("?")
-}
-
-pub const ALLOCATABLE_REGISTERS: [u8; 5] = [3, 12, 13, 14, 15]; // RBX, R12-R15
+/// A physical register, numbered however the target backend numbers its registers.
+pub type PhysReg = u8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Location { Register(u8), Spill(usize) }
+pub enum Location { Register(PhysReg), Spill(usize) }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Allocation {
@@ -25,7 +21,9 @@ pub struct Allocation {
 #[derive(Debug, Clone, Copy)]
 struct Interval { value: ValueId, start: usize, end: usize }
 
-pub fn allocate(program: &IrFunction) -> Allocation {
+/// Assign every value a register from `registers` or a spill slot. Values with
+/// overlapping live ranges never share a register.
+pub fn allocate(program: &IrFunction, registers: &[PhysReg]) -> Allocation {
     let mut intervals = vec![None::<(usize, usize)>; program.value_count];
     let mut positions = vec![0usize; program.blocks.len()];
     let mut pos = 0usize;
@@ -75,10 +73,10 @@ pub fn allocate(program: &IrFunction) -> Allocation {
     let mut spill_count = 0usize;
     for current in ordered {
         active.retain(|i| i.end >= current.start);
-        let occupied: Vec<u8> = active.iter().filter_map(|i| match locations[i.value] {
+        let occupied: Vec<PhysReg> = active.iter().filter_map(|i| match locations[i.value] {
             Location::Register(r) => Some(r), Location::Spill(_) => None,
         }).collect();
-        if let Some(reg) = ALLOCATABLE_REGISTERS.iter().copied().find(|r| !occupied.contains(r)) {
+        if let Some(reg) = registers.iter().copied().find(|r| !occupied.contains(r)) {
             locations[current.value] = Location::Register(reg);
             active.push(current);
             active.sort_by_key(|i| i.end);
@@ -181,15 +179,56 @@ fn uses(inst: &Instruction) -> Vec<ValueId> {
 mod tests {
     use super::*;
     use crate::{ir, lexer::lex, parser::Parser, sema};
-    #[test]
-    fn assigns_registers_and_tracks_live_ranges() {
-        let ast = Parser::new(lex("int main(){int x=1;int y=2;int z=3;return x+y+z;}").unwrap()).parse().unwrap();
+
+    /// Arbitrary register numbers: the allocator must not care which they are.
+    const FIVE: [PhysReg; 5] = [10, 11, 12, 13, 14];
+
+    fn function(source: &str) -> ir::IrFunction {
+        let ast = Parser::new(lex(source).unwrap()).parse().unwrap();
         let mut m = ir::lower(&sema::analyze(&ast).unwrap());
         ir::promote_locals_to_ssa(&mut m);
-        let p = m.functions.remove(0);
-        let a = allocate(&p);
+        m.functions.remove(0)
+    }
+    /// No two values whose live ranges overlap may share a register.
+    fn assert_no_conflicts(a: &Allocation) {
+        for (i, (li, ii)) in a.locations.iter().zip(&a.intervals).enumerate() {
+            for (j, (lj, ij)) in a.locations.iter().zip(&a.intervals).enumerate().skip(i + 1) {
+                let (Some((s1, e1)), Some((s2, e2))) = (ii, ij) else { continue };
+                if let (Location::Register(r1), Location::Register(r2)) = (li, lj) {
+                    assert!(r1 != r2 || e1 < s2 || e2 < s1, "%{i} and %{j} overlap in register {r1}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn assigns_registers_and_tracks_live_ranges() {
+        let p = function("int main(){int x=1;int y=2;int z=3;return x+y+z;}");
+        let a = allocate(&p, &FIVE);
         assert!(a.locations.iter().any(|l| matches!(l, Location::Register(_))));
         assert!(a.intervals.iter().any(Option::is_some));
         assert_eq!(a.locations.len(), p.value_count);
+    }
+    #[test]
+    fn only_uses_the_registers_it_was_given() {
+        let p = function("int f(int a,int b,int c,int d){return a+b*c-d;} int main(){return 0;}");
+        for set in [&[7u8][..], &[7, 9], &FIVE] {
+            let a = allocate(&p, set);
+            for l in &a.locations { if let Location::Register(r) = l { assert!(set.contains(r), "{r} not in {set:?}"); } }
+        }
+    }
+    #[test]
+    fn fewer_registers_means_more_spills_but_never_conflicts() {
+        let p = function("int f(int a,int b,int c,int d,int e,int g){return a+b*c-d+e*g+a*g;} int main(){return 0;}");
+        let (one, two, five) = (allocate(&p, &[7]), allocate(&p, &[7, 9]), allocate(&p, &FIVE));
+        assert!(one.spill_count > 0 && one.spill_count >= two.spill_count && two.spill_count >= five.spill_count,
+            "{} {} {}", one.spill_count, two.spill_count, five.spill_count);
+        for a in [&one, &two, &five] { assert_no_conflicts(a); }
+    }
+    #[test]
+    fn no_registers_spills_everything() {
+        let p = function("int main(){int x=1;int y=2;return x+y;}");
+        let a = allocate(&p, &[]);
+        assert!(a.locations.iter().all(|l| matches!(l, Location::Spill(_))));
     }
 }

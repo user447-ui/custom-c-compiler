@@ -36,3 +36,21 @@ Testing consequence: a missing `movsxd` is only visible when the operation and t
 
 `--dump-ast`, `--dump-ir[=lowered|ssa|opt]` and `--dump-regalloc` (see the README) print the compiler's intermediate state. `src/irdump.rs` renders values as `%N`, blocks as `bbN`, and phi nodes as `phi [bbPRED: %VALUE], ...`. `--dump-regalloc` appends the register or spill slot and the live interval (in linearised instruction positions) of every defined value, which is the quickest way to debug the allocator.
 
+## Targets and backends
+
+The front end, the IR, the optimizer and the register allocator do not depend on the target. Everything that does sits behind two seams:
+
+- **Architecture** — the `Backend` trait in `src/backend/mod.rs`. A backend supplies its allocatable registers (as opaque numbers), compiles one IR function at a time into machine code plus a list of unresolved calls, produces the program entry stub, and knows how to patch a call once the callee's address is known. `backend::generate` is architecture independent: it lays out the entry stub and all functions, then asks the backend to patch each call. A unit test drives it with a toy backend that shares nothing with x86-64.
+- **Operating system** — `src/object/` picks the executable file format (`Os::Linux` → ELF), and `Backend::entry_stub(os)` supplies what the OS needs at the entry point (on Linux: exit through a system call). The `e_machine` number comes from `Arch::elf_machine`.
+
+`src/backend/x86_64/` is split by concern. `abi.rs` is the only file that names registers and ABI facts, and a `const` assertion fails the build if an allocatable register is not callee-saved or collides with the code generator's scratch or argument registers. `encode.rs` is the only file with opcode bytes and has byte-level unit tests for each emitter. `mod.rs` decides what to emit.
+
+### Adding an architecture or operating system
+
+1. Add the variant to `Arch`/`Os` in `src/target.rs`; the compiler will point at each `match` that needs an arm.
+2. New architecture: add `src/backend/<arch>/` with its ABI facts, an encoder, and a `Backend` implementation modelled on `x86_64`, and return it from `backend::for_target`. The integer model matters: IR integers are 32-bit and wrap, so a backend must keep that true (x86-64 keeps values sign-extended in 64-bit registers; RV64 does so by convention, AArch64 can use 32-bit `w` registers).
+3. New operating system: add its object format under `src/object/`, its entry stub in each backend that supports it, and handle ABI differences (the Windows x64 convention passes four register arguments and requires 32 bytes of shadow space, for example).
+4. Add `--target` end-to-end tests. The differential fuzzer (`scripts/fuzz_vs_gcc.py`) needs a way to run the output, so for a foreign target use an emulator.
+
+Not done yet, and worth knowing before starting: types other than `int` will make `sema` and the IR depend on the target's data layout (pointer width; `long` is 64-bit on Linux but 32-bit on Windows), and there is no assembly text output (`-S`) or relocatable object output yet, so every backend currently emits and encodes machine code itself.
+

@@ -62,6 +62,15 @@ bb3:
 
 `br %c ? bbA : bbB` means "if `%c` is non-zero go to `bbA`, otherwise `bbB`". `sdiv`/`srem`/`slt`/... are signed 32-bit operations.
 
+### Targets
+
+```sh
+ccc --target=x86_64-linux -o f f.c     # the default, and currently the only target
+ccc --target=aarch64-linux -o f f.c    # ccc: error: unsupported architecture 'aarch64' ... (supported targets: x86_64-linux)
+```
+
+A target is an architecture plus an operating system. See `docs/architecture.md` ("Targets and backends") for what adding one involves.
+
 ### Differential fuzzing against gcc
 
 ```sh
@@ -76,9 +85,11 @@ scripts/fuzz_vs_gcc.py target/release/ccc 500      # needs gcc; keeps failing pr
 - `src/sema.rs`: function signatures and call checking, lexical scopes, identifier resolution, definite-assignment diagnostics.
 - `src/irdump.rs`: text form of the IR for `--dump-ir` / `--dump-regalloc`.
 - `src/ir.rs`: per-function IR (`IrModule`/`IrFunction`) with explicit basic blocks, `Param`/`Call` instructions, virtual values, control-flow terminators, constant folding, constant-branch simplification, unreachable-block pruning, and dead-value elimination.
-- `src/regalloc.rs`: block-level liveness and linear-scan allocation to the callee-saved registers RBX/R12-R15 with spill slots.
-- `src/codegen.rs`: `_start` stub, per-function prologue/epilogue, System V calls, direct basic-block IR to x86-64 emission, and branch/call fixups.
-- `src/elf.rs`: minimal ELF64 executable writer.
+- `src/regalloc.rs`: block-level liveness and target-independent linear-scan allocation over whatever registers the backend offers, with spill slots.
+- `src/target.rs`: `Arch`, `Os` and `Target` (`--target=ARCH-OS`).
+- `src/backend/mod.rs`: the `Backend` trait (one implementation per architecture), backend selection, and the architecture-independent step that links compiled functions and resolves calls.
+- `src/backend/x86_64/`: the x86-64 backend. `abi.rs` has the registers and System V facts (checked at build time), `encode.rs` is the only file with opcode bytes, `mod.rs` does frame layout, instruction selection, calls and phi copies.
+- `src/object/`: executable file formats chosen by operating system; `elf.rs` writes ELF64.
 - `tests/e2e.rs`: compile-and-run tests (expressions, whole programs with calls, invalid programs).
 - `scripts/fuzz_vs_gcc.py`: differential fuzzer comparing `ccc` with `gcc` on random programs (`scripts/fuzz_vs_gcc.py target/release/ccc 500`).
 
