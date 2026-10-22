@@ -2,9 +2,9 @@
 
 Experimental Rust compiler with a long-term goal of C17/C++20 frontends and a native x86-64 Linux backend. It emits machine code and ELF executables directly, without GCC, Clang, LLVM, an assembler, or a linker.
 
-## Current status: 0.13.0 bootstrap
+## Current status: 0.14.0 bootstrap
 
-Implemented subset: multiple `int` functions with up to any number of `int` parameters, prototypes, recursion and mutual recursion; calls following the System V AMD64 calling convention (first six arguments in RDI, RSI, RDX, RCX, R8, R9, the rest on the stack, result in RAX); decimal integer literals; parentheses; unary `+`, `-`, `~`, `!`; arithmetic `+`, `-`, `*`, signed `/`, `%`; bitwise `&`, `|`, `^`; comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`; short-circuit logical `&&`, `||`; local `int` declarations and assignment; nested blocks with lexical scope and shadowing; expression statements and the empty statement; `if`/`else`; `while`; and `return`. Comparisons and logical operators produce integer 0 or 1.
+Implemented subset: `int` is a real 32-bit signed type (arithmetic wraps modulo 2^32 like `gcc -fwrapv`; integer literals above 2147483647 are rejected, while `-2147483648` is accepted); multiple `int` functions with up to any number of `int` parameters, prototypes, recursion and mutual recursion; calls following the System V AMD64 calling convention (first six arguments in RDI, RSI, RDX, RCX, R8, R9, the rest on the stack, result in RAX); decimal integer literals; parentheses; unary `+`, `-`, `~`, `!`; arithmetic `+`, `-`, `*`, signed `/`, `%`; bitwise `&`, `|`, `^`; comparisons `==`, `!=`, `<`, `<=`, `>`, `>=`; short-circuit logical `&&`, `||`; local `int` declarations and assignment; nested blocks with lexical scope and shadowing; expression statements and the empty statement; `if`/`else`; `while`; and `return`. Comparisons and logical operators produce integer 0 or 1.
 
 ```c
 int gcd(int a, int b) {
@@ -14,7 +14,7 @@ int gcd(int a, int b) {
 int main(void) { return gcd(84, 36); }   /* exit status 12 */
 ```
 
-Semantic analysis resolves names, rejects use before declaration and same-scope redeclarations (a parameter and a top-level local of the same name conflict, as in C), and gives shadowed locals distinct internal names. It also checks functions: calls must target a function declared earlier (use a prototype for forward or mutual recursion), argument counts must match, `main` must exist and take no parameters, and a function that is called must be defined. Definite-assignment analysis rejects reads of uninitialized locals, checks both `if` paths, and conservatively assumes loops may execute zero times. This is not yet a conforming C compiler: `for`, `void`/other types (`int` is 64-bit), full type checking, preprocessing, pointers, arrays, structs, floating point, global variables, and C++ syntax are not implemented. Target is Linux x86-64.
+Semantic analysis resolves names, rejects use before declaration and same-scope redeclarations (a parameter and a top-level local of the same name conflict, as in C), and gives shadowed locals distinct internal names. It also checks functions: calls must target a function declared earlier (use a prototype for forward or mutual recursion), argument counts must match, `main` must exist and take no parameters, and a function that is called must be defined. Definite-assignment analysis rejects reads of uninitialized locals, checks both `if` paths, and conservatively assumes loops may execute zero times. This is not yet a conforming C compiler: `for`, `void` and other types such as `long`/`char`/`unsigned`, full type checking, preprocessing, pointers, arrays, structs, floating point, global variables, and C++ syntax are not implemented. Target is Linux x86-64.
 
 ## Build and run
 
@@ -29,12 +29,52 @@ echo $?
 
 Expected exit status: `5`.
 
+### Inspecting what the compiler does
+
+```sh
+ccc --dump-ast f.c            # the parsed AST
+ccc --dump-ir=lowered f.c     # IR straight from the AST (locals live in memory)
+ccc --dump-ir=ssa f.c         # after promoting locals to SSA (phi nodes appear)
+ccc --dump-ir f.c             # after optimization (same as --dump-ir=opt)
+ccc --dump-regalloc f.c       # optimized IR + register/spill slot and live range per value
+ccc --dump-ir -o f f.c        # dump and still produce the executable
+```
+
+Dumps go to stdout. Without `-o` nothing is written to disk. Example (`--dump-regalloc` on a `gcd` function):
+
+```text
+function gcd(2 params) {
+bb0:  ; entry
+  %0 = param 0                             ; rbx  live [0, 5]
+  %1 = param 1                             ; r12  live [2, 5]
+  jmp bb1
+bb1:
+  %10 = phi [bb0: %0], [bb2: %9]           ; rbx  live [6, 16]
+  %9 = phi [bb0: %1], [bb2: %6]            ; r12  live [8, 15]
+  br %9 ? bb2 : bb3
+bb2:
+  %6 = srem %10, %9                        ; r13  live [12, 15]
+  jmp bb1
+bb3:
+  ret %10
+}
+```
+
+`br %c ? bbA : bbB` means "if `%c` is non-zero go to `bbA`, otherwise `bbB`". `sdiv`/`srem`/`slt`/... are signed 32-bit operations.
+
+### Differential fuzzing against gcc
+
+```sh
+scripts/fuzz_vs_gcc.py target/release/ccc 500      # needs gcc; keeps failing programs in /tmp/fz
+```
+
 ## Source layout
 
 - `src/lexer.rs`: tokens, offsets, C comments.
 - `src/ast.rs`: function, statement and expression AST.
 - `src/parser.rs`: top-level functions/prototypes, statements, and a Pratt expression parser (including calls).
 - `src/sema.rs`: function signatures and call checking, lexical scopes, identifier resolution, definite-assignment diagnostics.
+- `src/irdump.rs`: text form of the IR for `--dump-ir` / `--dump-regalloc`.
 - `src/ir.rs`: per-function IR (`IrModule`/`IrFunction`) with explicit basic blocks, `Param`/`Call` instructions, virtual values, control-flow terminators, constant folding, constant-branch simplification, unreachable-block pruning, and dead-value elimination.
 - `src/regalloc.rs`: block-level liveness and linear-scan allocation to the callee-saved registers RBX/R12-R15 with spill slots.
 - `src/codegen.rs`: `_start` stub, per-function prologue/epilogue, System V calls, direct basic-block IR to x86-64 emission, and branch/call fixups.
@@ -55,7 +95,8 @@ Expected exit status: `5`.
 - [x] Explicit phi nodes for short-circuit expression results, with edge-specific copies in the native backend.
 - [x] Promote local variables to SSA with dominator trees, dominance frontiers, and phi nodes at control-flow joins.
 - [x] Multiple functions, prototypes, recursion, and System V AMD64 calls (register and stack arguments).
-- [ ] C types (including a real 32-bit `int`), pointers, arrays, structs, enums, preprocessing and multiple translation units.
+- [x] 32-bit `int` semantics (wrapping arithmetic, literal range checks), `--dump-ast` / `--dump-ir` / `--dump-regalloc`.
+- [ ] More C types (`char`, `long`, `unsigned`, pointers), arrays, structs, enums, preprocessing and multiple translation units.
 - [ ] ELF relocatable objects, symbols, relocations and linking.
 - [ ] Broader C17 conformance, then incremental C++20 features.
 - [x] Liveness intervals and linear-scan allocation to x86-64 registers with spill slots.

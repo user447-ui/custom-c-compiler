@@ -6,8 +6,11 @@ Usage: scripts/fuzz_vs_gcc.py target/release/ccc 500 [first_seed]
 Each program has 0-3 helper functions (0-8 int parameters, so both register and
 stack argument passing are exercised) that may call earlier helpers, plus a
 `main` using loops, nested blocks, shadowing and short-circuit operators.
-Values are kept small so 32-bit gcc `int` and ccc's 64-bit `int` agree and the
-programs have no undefined behaviour. Failing programs are kept in /tmp/fz/.
+Constants include values near INT_MAX/INT_MIN and many results are left
+unbounded, so 32-bit overflow is exercised constantly. gcc is run with -fwrapv,
+which defines signed overflow as wrapping, so the programs have no undefined
+behaviour (division by zero and INT_MIN / -1 are avoided by construction).
+Failing programs are kept in /tmp/fz/.
 """
 import os, random, subprocess, sys
 os.makedirs("/tmp/fz", exist_ok=True)
@@ -19,19 +22,25 @@ def gen_body(r, counter, params, callables, nstmts, depth):
     def allvars(): return [v for s in vars_stack for v in s]
     def fresh(prefix="v"):
         counter[0] += 1; return f"{prefix}{counter[0]}"
-    def bounded(e): return f"(({e}) % 97)"
+    BIG = ["2147483647", "2147483646", "(-2147483647 - 1)", "65535", "65536", "46340", "46341",
+           "1073741824", "255", "256", "123456789"]
+    def literal():
+        return r.choice(BIG) if r.random() < 0.5 else str(r.randint(0, 20))
+    def bounded(e):
+        # Half of the time keep values small, half of the time let them overflow.
+        return f"(({e}) % 97)" if r.random() < 0.5 else f"({e})"
     def expr(d):
         vs = allvars()
         if d <= 0 or r.random() < 0.25:
-            return r.choice(vs) if vs and r.random() < 0.7 else str(r.randint(0, 20))
+            return r.choice(vs) if vs and r.random() < 0.7 else literal()
         k = r.random()
-        if k < 0.10: return f"({r.choice(['-','!','~','+'])}{expr(d-1)})"
+        if k < 0.10: return f"({r.choice(['-','-','!','~','+'])}{expr(d-1)})"
         if k < 0.17: return f"(({expr(d-1)}) / (({expr(d-1)}) % 5 + 7))"
         if k < 0.22: return f"(({expr(d-1)}) % (({expr(d-1)}) % 5 + 7))"
         if k < 0.34 and callables:
             name, n = r.choice(callables)
             return f"{name}({', '.join(bounded(expr(d-1)) for _ in range(n))})"
-        op = r.choice(['+','-','*','&','|','^','==','!=','<','<=','>','>=','&&','||'])
+        op = r.choice(['+','+','-','-','*','*','&','|','^','==','!=','<','<=','>','>=','&&','||'])
         return f"({expr(d-1)} {op} {expr(d-1)})"
     def stmt(d, loops):
         vs = allvars(); k = r.random()
@@ -58,10 +67,18 @@ def gen_body(r, counter, params, callables, nstmts, depth):
     def block(d, loops): return "{ " + " ".join(stmt(d, loops) for _ in range(r.randint(1, 4))) + " }"
     head = []
     for _ in range(r.randint(1, 4)):
-        n = fresh(); head.append(f"int {n} = {r.randint(0, 20)};"); vars_stack[0].append(n)
+        n = fresh(); head.append(f"int {n} = {literal()};"); vars_stack[0].append(n)
     body = [stmt(depth, 0) for _ in range(nstmts)]
     vs = allvars()
-    ret = " + ".join(r.sample(vs, min(len(vs), 6))) if vs else "0"
+    # The result mixes plain values with comparisons and sign tests, which expose
+    # values that are wrong in their upper bits even when the low bits agree.
+    picks = r.sample(vs, min(len(vs), 6)) if vs else []
+    terms = list(picks)
+    for k, v in enumerate(picks):
+        w = r.choice(vs)
+        terms.append(f"({v} {r.choice(['<', '>', '<=', '>='])} {w}) * {k + 1}")
+        terms.append(f"({v} < 0) * {k + 7}")
+    ret = " + ".join(terms) if terms else "0"
     return "\n  ".join(head + body) + f"\n  return ({ret}) % 251;"
 
 def gen(r):
@@ -82,7 +99,7 @@ bad = rej = 0
 for s in range(seed0, seed0 + N):
     src = gen(random.Random(s)); p = f"/tmp/fz/p{s}"
     open(p + ".c", "w").write(src)
-    g = subprocess.run(["gcc", "-w", "-O0", "-o", p + "_g", p + ".c"], capture_output=True)
+    g = subprocess.run(["gcc", "-w", "-fwrapv", "-O0", "-o", p + "_g", p + ".c"], capture_output=True)
     if g.returncode: os.remove(p + ".c"); continue
     try: gr = subprocess.run([p + "_g"], capture_output=True, timeout=5).returncode
     except subprocess.TimeoutExpired: os.remove(p + ".c"); os.remove(p + "_g"); continue

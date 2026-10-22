@@ -3,6 +3,13 @@ use crate::ir::{Instruction, IrFunction, Terminator, ValueId};
 /// Physical registers used for long-lived virtual values. All of them are
 /// callee-saved in the System V ABI, so values living in them survive calls; each
 /// function saves and restores the ones it actually uses.
+/// Assembly name of an x86-64 general-purpose register number (0 = rax ... 15 = r15).
+pub fn register_name(reg: u8) -> &'static str {
+    const NAMES: [&str; 16] = ["rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi",
+        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15"];
+    NAMES.get(reg as usize).copied().unwrap_or("?")
+}
+
 pub const ALLOCATABLE_REGISTERS: [u8; 5] = [3, 12, 13, 14, 15]; // RBX, R12-R15
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

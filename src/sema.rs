@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use crate::ast::{Expr, Function, Program, Stmt};
+use crate::ast::{Expr, Function, Program, Stmt, UnaryOp};
 
 /// Resolve identifiers and validate declarations while preserving lexical scope,
 /// check function declarations and calls, then reject reads of locals that are
@@ -120,7 +120,16 @@ impl Analyzer {
     }
     fn expr(&mut self, e: &Expr) -> Result<Expr, String> {
         Ok(match e {
-            Expr::Number(n) => Expr::Number(*n),
+            // `-2147483648` is the one literal that only fits once the minus is applied.
+            Expr::Unary { op: UnaryOp::Minus, expr } if matches!(**expr, Expr::Number(n) if n == 1 << 31) => {
+                Expr::Number(i64::from(i32::MIN))
+            }
+            Expr::Number(n) => {
+                if i32::try_from(*n).is_err() {
+                    return Err(format!("integer literal {n} is too large for 'int' (the maximum is 2147483647)"));
+                }
+                Expr::Number(*n)
+            }
             Expr::Variable(n) => Expr::Variable(self.resolve(n)?),
             Expr::Unary { op, expr } => Expr::Unary { op: *op, expr: Box::new(self.expr(expr)?) },
             Expr::Binary { op, left, right } => Expr::Binary {
@@ -290,5 +299,16 @@ mod tests {
     }
     #[test] fn call_arguments_must_be_initialized() {
         assert!(run("int f(int a){return a;} int main(){int x; return f(x);}").unwrap_err().contains("uninitialized"));
+    }
+
+    #[test] fn int_literal_range() {
+        assert!(run("int main(){return 2147483647;}").is_ok());
+        assert!(run("int main(){return 2147483648;}").unwrap_err().contains("too large for 'int'"));
+        assert!(run("int main(){return 4294967296 == 0;}").is_err());
+    }
+    #[test] fn int_min_literal_is_allowed_under_minus() {
+        let p = run("int main(){return -2147483648;}").unwrap();
+        assert_eq!(main_body(&p)[0], Stmt::Return(Expr::Number(i64::from(i32::MIN))));
+        assert!(run("int main(){return -2147483649;}").is_err());
     }
 }

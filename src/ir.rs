@@ -26,7 +26,9 @@ pub struct BasicBlock {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Instruction {
-    Const { dst: ValueId, value: i64 },
+    /// A 32-bit signed constant. All IR integer values have C `int` semantics:
+    /// 32 bits wide, with arithmetic wrapping modulo 2^32.
+    Const { dst: ValueId, value: i32 },
     /// The incoming argument number `index` (0-based), read once at function entry.
     Param { dst: ValueId, index: usize },
     /// Call `callee` with `args`; has side effects, so it is never removed as dead code.
@@ -288,15 +290,12 @@ pub fn optimize(mut module: IrModule) -> IrModule {
 
 fn optimize_function(mut program: IrFunction) -> IrFunction {
     for block in &mut program.blocks {
-        let mut constants = std::collections::HashMap::<ValueId, i64>::new();
+        let mut constants = std::collections::HashMap::<ValueId, i32>::new();
         for inst in &mut block.instructions {
             match inst.clone() {
                 Instruction::Const { dst, value } => { constants.insert(dst, value); }
                 Instruction::Unary { dst, op, src } => {
-                    let folded = constants.get(&src).copied().and_then(|n| match op {
-                        IrUnary::Plus => Some(n), IrUnary::Negate => n.checked_neg(),
-                        IrUnary::BitNot => Some(!n), IrUnary::LogicalNot => Some(i64::from(n == 0)),
-                    });
+                    let folded = constants.get(&src).copied().map(|n| fold_unary(op, n));
                     if let Some(value) = folded {
                         *inst = Instruction::Const { dst, value }; constants.insert(dst, value);
                     } else { constants.remove(&dst); }
@@ -310,7 +309,7 @@ fn optimize_function(mut program: IrFunction) -> IrFunction {
                 }
                 Instruction::ToBool { dst, src } => {
                     if let Some(n) = constants.get(&src).copied() {
-                        let value = i64::from(n != 0);
+                        let value = i32::from(n != 0);
                         *inst = Instruction::Const { dst, value }; constants.insert(dst, value);
                     } else { constants.remove(&dst); }
                 }
@@ -333,15 +332,12 @@ fn optimize_function(mut program: IrFunction) -> IrFunction {
 
 fn simplify_constant_branches(program: &mut IrFunction) {
     for block in &mut program.blocks {
-        let mut constants = std::collections::HashMap::<ValueId, i64>::new();
+        let mut constants = std::collections::HashMap::<ValueId, i32>::new();
         for inst in &block.instructions {
             match inst {
                 Instruction::Const { dst, value } => { constants.insert(*dst, *value); }
                 Instruction::Unary { dst, op, src } => {
-                    let value = constants.get(src).copied().and_then(|n| match op {
-                        IrUnary::Plus => Some(n), IrUnary::Negate => n.checked_neg(),
-                        IrUnary::BitNot => Some(!n), IrUnary::LogicalNot => Some(i64::from(n == 0)),
-                    });
+                    let value = constants.get(src).copied().map(|n| fold_unary(*op, n));
                     if let Some(value) = value { constants.insert(*dst, value); }
                 }
                 Instruction::Binary { dst, op, lhs, rhs } => {
@@ -349,7 +345,7 @@ fn simplify_constant_branches(program: &mut IrFunction) {
                         .and_then(|(a,b)| fold_binary(*op,a,b)) { constants.insert(*dst, value); }
                 }
                 Instruction::ToBool { dst, src } => {
-                    if let Some(n) = constants.get(src).copied() { constants.insert(*dst, i64::from(n != 0)); }
+                    if let Some(n) = constants.get(src).copied() { constants.insert(*dst, i32::from(n != 0)); }
                 }
                 Instruction::LoadLocal { dst, .. } | Instruction::Phi { dst, .. }
                 | Instruction::Param { dst, .. } | Instruction::Call { dst, .. } => { constants.remove(dst); }
@@ -454,15 +450,28 @@ fn eliminate_dead_values(program: &mut IrFunction) {
     }
 }
 
-fn fold_binary(op: IrBinary, a: i64, b: i64) -> Option<i64> {
+/// Constant folding follows the semantics of the generated code: 32-bit `int`
+/// arithmetic that wraps modulo 2^32 (as with `gcc -fwrapv`).
+fn fold_unary(op: IrUnary, n: i32) -> i32 {
+    match op {
+        IrUnary::Plus => n,
+        IrUnary::Negate => n.wrapping_neg(),
+        IrUnary::BitNot => !n,
+        IrUnary::LogicalNot => i32::from(n == 0),
+    }
+}
+
+/// Division and remainder are left unfolded when the hardware would fault
+/// (division by zero, `INT_MIN / -1`), so the program behaves as it would at run time.
+fn fold_binary(op: IrBinary, a: i32, b: i32) -> Option<i32> {
     Some(match op {
-        IrBinary::Add => a.checked_add(b)?, IrBinary::Sub => a.checked_sub(b)?,
-        IrBinary::Mul => a.checked_mul(b)?, IrBinary::Div => a.checked_div(b)?,
+        IrBinary::Add => a.wrapping_add(b), IrBinary::Sub => a.wrapping_sub(b),
+        IrBinary::Mul => a.wrapping_mul(b), IrBinary::Div => a.checked_div(b)?,
         IrBinary::Rem => a.checked_rem(b)?, IrBinary::BitAnd => a & b,
         IrBinary::BitOr => a | b, IrBinary::BitXor => a ^ b,
-        IrBinary::Equal => i64::from(a == b), IrBinary::NotEqual => i64::from(a != b),
-        IrBinary::Less => i64::from(a < b), IrBinary::LessEqual => i64::from(a <= b),
-        IrBinary::Greater => i64::from(a > b), IrBinary::GreaterEqual => i64::from(a >= b),
+        IrBinary::Equal => i32::from(a == b), IrBinary::NotEqual => i32::from(a != b),
+        IrBinary::Less => i32::from(a < b), IrBinary::LessEqual => i32::from(a <= b),
+        IrBinary::Greater => i32::from(a > b), IrBinary::GreaterEqual => i32::from(a >= b),
     })
 }
 
@@ -490,7 +499,7 @@ impl Builder {
     fn jump_if_open(&mut self, target: BlockId) {
         if self.blocks[self.current].terminator.is_none() { self.terminate(Terminator::Jump(target)); }
     }
-    fn constant(&mut self, value: i64) -> ValueId {
+    fn constant(&mut self, value: i32) -> ValueId {
         let dst = self.value(); self.emit(Instruction::Const { dst, value }); dst
     }
     fn statement(&mut self, s: &Stmt) {
@@ -539,7 +548,7 @@ impl Builder {
     }
     fn expression(&mut self, e: &Expr) -> ValueId {
         match e {
-            Expr::Number(value) => self.constant(*value),
+            Expr::Number(value) => self.constant(i32::try_from(*value).expect("sema guarantees literals fit in int")),
             Expr::Variable(name) => {
                 let dst = self.value(); self.emit(Instruction::LoadLocal { dst, name: name.clone() }); dst
             }
@@ -582,7 +591,7 @@ impl Builder {
         let (if_zero, if_nonzero) = if is_and { (short_block, rhs_block) } else { (rhs_block, short_block) };
         self.terminate(Terminator::Branch { condition: lhs, if_zero, if_nonzero });
         self.current = short_block;
-        let short_value = self.constant(i64::from(!is_and));
+        let short_value = self.constant(i32::from(!is_and));
         self.terminate(Terminator::Jump(merge_block));
         self.current = rhs_block;
         let rhs = self.expression(right);

@@ -23,3 +23,16 @@ The backend follows the System V AMD64 ABI. The first six integer arguments trav
 Each function has the frame layout (8-byte slots addressed from RBP): locals, register spill slots, phi staging slots, the incoming register arguments, and the callee-saved registers the function uses. The prologue stores the incoming argument registers immediately, because RCX and RDX are scratch registers in the generated code, and saves the callee-saved registers it uses; every return restores them and executes `mov rsp, rbp; pop rbp; ret`. The allocatable registers RBX and R12-R15 are all callee-saved, so a value kept in one of them survives a call without any caller-side spilling.
 
 Call targets are resolved after all functions are emitted: each `call rel32` is recorded with the callee name and patched once function offsets are known.
+
+## Integer model
+
+C `int` is a 32-bit signed integer. The IR has exactly one value type with those semantics: `Const` holds an `i32`, arithmetic wraps modulo 2^32, `sdiv`/`srem` are signed and truncate toward zero, and the optimizer folds constants with wrapping arithmetic (division by zero and `INT_MIN / -1` are left for run time, where they fault as on real hardware). Semantic analysis rejects literals above `INT_MAX`; `-2147483648` is accepted as a special case.
+
+The x86-64 backend keeps every value in canonical form: the 64-bit sign extension of its 32-bit value, in registers and in frame slots. Bitwise operations, comparisons and booleans preserve that form for free; `add`, `sub`, `mul`, `neg` and `sdiv`/`srem` re-canonicalise with `movsxd` (division uses a genuine 32-bit `idiv`). Because the System V ABI leaves the upper half of 32-bit arguments and results undefined, parameters are read as sign-extended dwords and call results are sign-extended after the call, so the generated code does not depend on its callers or callees keeping them clean.
+
+Testing consequence: a missing `movsxd` is only visible when the operation and the observing comparison or division are in the same function, since the call-result sign extension would otherwise repair the value. `tests/e2e.rs::int_is_32_bits_and_wraps` is written that way on purpose.
+
+## Debugging output
+
+`--dump-ast`, `--dump-ir[=lowered|ssa|opt]` and `--dump-regalloc` (see the README) print the compiler's intermediate state. `src/irdump.rs` renders values as `%N`, blocks as `bbN`, and phi nodes as `phi [bbPRED: %VALUE], ...`. `--dump-regalloc` appends the register or spill slot and the live interval (in linearised instruction positions) of every defined value, which is the quickest way to debug the allocator.
+

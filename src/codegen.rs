@@ -2,6 +2,15 @@ use std::collections::HashMap;
 use crate::ir::{BlockId, Instruction, IrBinary, IrFunction, IrModule, IrUnary, Terminator, ValueId};
 use crate::regalloc::{self, Allocation, Location, ALLOCATABLE_REGISTERS};
 
+// Integer model: C `int` is 32 bits. Every value held in a register or frame
+// slot is the *sign extension* to 64 bits of its 32-bit value ("canonical form").
+// AND/OR/XOR/NOT, comparisons and booleans keep that form automatically; operations
+// that can overflow (add, sub, mul, neg, div) re-canonicalise with `movsxd`.
+// Values entering from outside (parameters, call results) are sign-extended
+// explicitly because the System V ABI leaves the upper 32 bits undefined.
+const MOVSXD_RAX_EAX: [u8; 3] = [0x48, 0x63, 0xc0];
+const MOVSXD_RAX_EDX: [u8; 3] = [0x48, 0x63, 0xc2];
+
 /// System V AMD64 integer argument registers: RDI, RSI, RDX, RCX, R8, R9.
 const ARG_REGS: [u8; 6] = [7, 6, 2, 1, 8, 9];
 
@@ -211,6 +220,11 @@ impl Generator {
         self.code.extend_from_slice(&[0x48 | if reg >= 8 { 0x04 } else { 0 }, 0x8b, 0x85 | ((reg & 7) << 3)]);
         self.code.extend_from_slice(&(-displacement).to_le_bytes());
     }
+    /// movsxd rax, dword [rbp - displacement]
+    fn load_rax_dword(&mut self, displacement: i32) {
+        self.code.extend_from_slice(&[0x48, 0x63, 0x85]);
+        self.code.extend_from_slice(&(-displacement).to_le_bytes());
+    }
     fn load_rax(&mut self, displacement: i32) { self.load_reg(0, displacement) }
     fn store_rax(&mut self, displacement: i32) { self.store_reg(0, displacement) }
     fn jump(&mut self, opcode: &[u8], target: BlockId) {
@@ -242,6 +256,7 @@ impl Generator {
             self.code.extend_from_slice(&[0x48, 0x81, 0xc4]); // add rsp, imm32
             self.code.extend_from_slice(&cleanup.to_le_bytes());
         }
+        self.code.extend_from_slice(&MOVSXD_RAX_EAX); // the callee returns an `int` in EAX
         self.store_rax_value(dst)
     }
     fn instruction(&mut self, inst: &Instruction) -> Result<(), String> {
@@ -251,15 +266,16 @@ impl Generator {
             }
             Instruction::Const { dst, value } => {
                 self.code.extend_from_slice(&[0x48, 0xb8]);
-                self.code.extend_from_slice(&value.to_le_bytes());
+                self.code.extend_from_slice(&i64::from(*value).to_le_bytes());
                 self.store_rax_value(*dst)?;
             }
             Instruction::Param { dst, index } => {
+                // Read only the low 32 bits: the caller need not extend the argument.
                 if let Some(slot) = self.param_slots.get(*index).copied() {
-                    self.load_rax(slot);
+                    self.load_rax_dword(slot);
                 } else {
                     // Stack argument #6 is at [rbp + 16], #7 at [rbp + 24], ...
-                    self.load_rax(-(16 + 8 * (*index as i32 - ARG_REGS.len() as i32)));
+                    self.load_rax_dword(-(16 + 8 * (*index as i32 - ARG_REGS.len() as i32)));
                 }
                 self.store_rax_value(*dst)?;
             }
@@ -276,7 +292,10 @@ impl Generator {
                 self.load_value_rax(*src)?;
                 match op {
                     IrUnary::Plus => {}
-                    IrUnary::Negate => self.code.extend_from_slice(&[0x48, 0xf7, 0xd8]),
+                    IrUnary::Negate => {
+                        self.code.extend_from_slice(&[0x48, 0xf7, 0xd8]); // neg rax
+                        self.code.extend_from_slice(&MOVSXD_RAX_EAX); // -INT_MIN wraps
+                    }
                     IrUnary::BitNot => self.code.extend_from_slice(&[0x48, 0xf7, 0xd0]),
                     IrUnary::LogicalNot => self.code.extend_from_slice(&[0x48, 0x85, 0xc0, 0x0f, 0x94, 0xc0, 0x48, 0x0f, 0xb6, 0xc0]),
                 }
@@ -291,12 +310,24 @@ impl Generator {
                 self.load_value_rax(*lhs)?;
                 self.load_value_rcx(*rhs)?;
                 match op {
-                    IrBinary::Add => self.code.extend_from_slice(&[0x48, 0x01, 0xc8]),
-                    IrBinary::Sub => self.code.extend_from_slice(&[0x48, 0x29, 0xc8]),
-                    IrBinary::Mul => self.code.extend_from_slice(&[0x48, 0x0f, 0xaf, 0xc1]),
+                    IrBinary::Add => {
+                        self.code.extend_from_slice(&[0x48, 0x01, 0xc8]);
+                        self.code.extend_from_slice(&MOVSXD_RAX_EAX);
+                    }
+                    IrBinary::Sub => {
+                        self.code.extend_from_slice(&[0x48, 0x29, 0xc8]);
+                        self.code.extend_from_slice(&MOVSXD_RAX_EAX);
+                    }
+                    IrBinary::Mul => {
+                        self.code.extend_from_slice(&[0x48, 0x0f, 0xaf, 0xc1]);
+                        self.code.extend_from_slice(&MOVSXD_RAX_EAX);
+                    }
                     IrBinary::Div | IrBinary::Rem => {
-                        self.code.extend_from_slice(&[0x48, 0x99, 0x48, 0xf7, 0xf9]);
-                        if *op == IrBinary::Rem { self.code.extend_from_slice(&[0x48, 0x89, 0xd0]); }
+                        // 32-bit signed division (`cdq; idiv ecx`), which faults on
+                        // division by zero and INT_MIN / -1 exactly as C `int` does on x86.
+                        self.code.extend_from_slice(&[0x99, 0xf7, 0xf9]);
+                        let quotient_or_remainder = if *op == IrBinary::Div { MOVSXD_RAX_EAX } else { MOVSXD_RAX_EDX };
+                        self.code.extend_from_slice(&quotient_or_remainder);
                     }
                     IrBinary::BitAnd => self.code.extend_from_slice(&[0x48, 0x21, 0xc8]),
                     IrBinary::BitOr => self.code.extend_from_slice(&[0x48, 0x09, 0xc8]),

@@ -114,3 +114,139 @@ fn rejects_invalid_function_programs() {
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// `int` is 32 bits wide and arithmetic wraps. Each operation and its comparison
+// live in the same function (a call boundary re-normalises the result, which
+// would hide a missing wrap), and operands arrive through parameters so the
+// optimizer cannot fold them. Every case is true under `gcc -fwrapv`.
+// ---------------------------------------------------------------------------
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn int_is_32_bits_and_wraps() {
+    let programs: [(&str, &str, i32); 26] = [
+        ("negative constant on the right of a comparison", "int gt_m1(int a){return a > -1;} int main(void){ return gt_m1(5); }", 1),
+        ("negative constant on the left of a comparison", "int lt_m1(int a){return -1 < a;} int main(void){ return lt_m1(5); }", 1),
+        ("negative constant in arithmetic", "int f(int a){return a + -3 == 2;} int main(void){ return f(5); }", 1),
+        ("negative constant is below zero", "int f(int a){return -100 < a && a < 100;} int main(void){ return f(0); }", 1),
+        ("add wraps to negative", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return add_lt0(2147483647,1); }", 1),
+        ("add max+max", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return add_eq(2147483647,2147483647,-2); }", 1),
+        ("sub wraps to positive", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return sub_gt0((-2147483647-1),1); }", 1),
+        ("sub min-max", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return sub_eq((-2147483647-1),2147483647,1); }", 1),
+        ("mul 65536*65536", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return mul_eq(65536,65536,0); }", 1),
+        ("mul 46341*46341 is negative", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return mul_lt0(46341,46341); }", 1),
+        ("mul 123456789*37", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return mul_eq(123456789,37,272933897); }", 1),
+        ("negating INT_MIN stays negative", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return neg_lt0((-2147483647-1)); }", 1),
+        ("negating INT_MIN is INT_MIN", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return neg_eq((-2147483647-1),(-2147483647-1)); }", 1),
+        ("division of INT_MIN", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return quot_eq((-2147483647-1),7,-306783378); }", 1),
+        ("remainder of INT_MIN", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return mod_eq((-2147483647-1),7,-2); }", 1),
+        ("division truncates toward zero", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return quot_eq(-7,2,-3); }", 1),
+        ("remainder takes dividend sign", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return mod_eq(-7,3,-1); }", 1),
+        ("overflowed result crosses a call", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return is_neg(add(2147483647,1)); }", 1),
+        ("overflow inside a condition", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ int a=2147483647; if (add(a,1) < a) return 1; return 0; }", 1),
+        ("fold: INT_MAX+1", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return (2147483647 + 1) < 0; }", 1),
+        ("fold: 65536*65536", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return 65536 * 65536 == 0; }", 1),
+        ("fold: INT_MIN literal", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return -2147483648 < 0; }", 1),
+        ("fold: negate INT_MIN", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ return -(-2147483647 - 1) < 0; }", 1),
+        ("bitnot of INT_MAX", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ int a = 2147483647; return (~a) < 0 && (a + 1) == (~a); }", 1),
+        ("seventh (stack) argument", "int f(int a,int b,int c,int d,int e,int g,int h){return (h+a) < 0;} int main(void){ return f(2147483647,0,0,0,0,0,1); }", 1),
+        ("hash loop wraps", "int add_lt0(int a,int b){return a+b<0;} int add_eq(int a,int b,int c){return a+b==c;} int sub_gt0(int a,int b){return a-b>0;} int sub_eq(int a,int b,int c){return a-b==c;} int mul_lt0(int a,int b){return a*b<0;} int mul_eq(int a,int b,int c){return a*b==c;} int neg_lt0(int a){return -a<0;} int neg_eq(int a,int c){return -a==c;} int quot_eq(int a,int b,int c){return a/b==c;} int mod_eq(int a,int b,int c){return a%b==c;} int is_neg(int x){return x<0;} int add(int a,int b){return a+b;} int main(void){ int h=5381; int i=0; while(i<20){ h=h*33+i; i=i+1; } return (h % 251) + 100; }", 33),
+    ];
+    for (name, source, want) in programs {
+        assert_eq!(compile_and_run("int32", source), Ok(want), "program '{name}': {source}");
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn rejects_integer_literals_that_do_not_fit_in_int() {
+    assert_eq!(compile_and_run("lit", "int main(void){ return 2147483647 == 2147483647; }"), Ok(1));
+    for source in ["int main(void){ return 2147483648; }", "int main(void){ return 4294967296 == 0; }", "int main(void){ return -2147483649; }"] {
+        let message = compile_and_run("lit", source).expect_err(source);
+        assert!(message.contains("too large for 'int'"), "{source}: {message}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Command line: --dump-ast / --dump-ir / --dump-regalloc
+// ---------------------------------------------------------------------------
+
+fn run_ccc(args: &[&str]) -> (bool, String, String) {
+    let o = Command::new(env!("CARGO_BIN_EXE_ccc")).args(args).output().unwrap();
+    (o.status.success(), String::from_utf8_lossy(&o.stdout).into_owned(), String::from_utf8_lossy(&o.stderr).into_owned())
+}
+
+fn temp_source(tag: &str, source: &str) -> std::path::PathBuf {
+    let p = std::env::temp_dir().join(format!("ccc-dump-{}-{tag}.c", std::process::id()));
+    fs::write(&p, source).unwrap();
+    p
+}
+
+const GCD: &str = "int gcd(int a,int b){ while(b){int t=b; b=a%b; a=t;} return a;} int main(void){return gcd(84,36);}";
+
+#[test]
+fn dump_ir_stages_show_the_pipeline() {
+    let src = temp_source("stages", GCD);
+    let path = src.to_str().unwrap();
+    let (ok, lowered, _) = run_ccc(&["--dump-ir=lowered", path]);
+    assert!(ok && lowered.contains("function gcd(2 params)") && lowered.contains("= load b#1") && !lowered.contains("phi"), "{lowered}");
+    let (ok, ssa, _) = run_ccc(&["--dump-ir=ssa", path]);
+    assert!(ok && ssa.contains("= phi [bb0: %") && !ssa.contains("load"), "{ssa}");
+    let (ok, opt, _) = run_ccc(&["--dump-ir", path]);
+    assert!(ok && opt.contains("= srem") && opt.contains("= call gcd(%0, %1)") && opt.contains("ret %"), "{opt}");
+    assert!(opt.matches("function ").count() == 2, "{opt}");
+    let _ = fs::remove_file(src);
+}
+
+#[test]
+fn dump_regalloc_annotates_values_with_locations() {
+    let src = temp_source("regalloc", GCD);
+    let (ok, text, _) = run_ccc(&["--dump-regalloc", src.to_str().unwrap()]);
+    assert!(ok, "{text}");
+    assert!(text.contains("; rbx  live ["), "{text}");
+    assert!(text.lines().any(|l| l.contains("= srem") && l.contains("; r1") && l.contains("live [")), "{text}");
+    let _ = fs::remove_file(src);
+}
+
+#[test]
+fn dump_ast_prints_the_parsed_program() {
+    let src = temp_source("ast", GCD);
+    let (ok, text, _) = run_ccc(&["--dump-ast", src.to_str().unwrap()]);
+    assert!(ok && text.contains("Function {") && text.contains("name: \"gcd\"") && text.contains("While {"), "{text}");
+    let _ = fs::remove_file(src);
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn dump_without_output_writes_no_binary_and_with_output_does_both() {
+    let src = temp_source("both", GCD);
+    let out = src.with_extension("out");
+    let _ = fs::remove_file(&out);
+    let (ok, _, _) = run_ccc(&["--dump-ir", src.to_str().unwrap()]);
+    assert!(ok && !out.exists());
+    let (ok, text, _) = run_ccc(&["--dump-ir", "-o", out.to_str().unwrap(), src.to_str().unwrap()]);
+    assert!(ok && text.contains("function gcd") && out.exists());
+    assert_eq!(Command::new(&out).status().unwrap().code(), Some(12));
+    let _ = fs::remove_file(src);
+    let _ = fs::remove_file(out);
+}
+
+#[test]
+fn command_line_errors_are_reported_with_usage() {
+    let src = temp_source("cli", GCD);
+    let path = src.to_str().unwrap();
+    for (args, expected) in [
+        (vec![path], "nothing to do"),
+        (vec!["--dump-ir=bogus", path], "unknown IR stage"),
+        (vec!["--dump-regalloc", "--dump-ir=ssa", path], "only applies to the optimized IR"),
+        (vec!["--frobnicate", path], "unknown option"),
+        (vec!["-o", "x"], "no input file"),
+    ] {
+        let (ok, _, err) = run_ccc(&args);
+        assert!(!ok && err.contains(expected) && err.contains("usage: ccc"), "{args:?}: {err}");
+    }
+    let (ok, out, _) = run_ccc(&["--version"]);
+    assert!(ok && out.starts_with("ccc 0.14.0"));
+    let _ = fs::remove_file(src);
+}
