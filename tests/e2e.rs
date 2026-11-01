@@ -200,6 +200,53 @@ fn octal_and_hexadecimal_literals_match_c() {
     }
 }
 
+/// The limits these tests probe live in `src/parser.rs` (a binary crate, so they are
+/// repeated here): 256 levels of parentheses/unary/call nesting, 1000 levels of statement
+/// nesting, and expression trees up to 10000 levels tall.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn programs_at_the_nesting_limits_compile_and_run() {
+    let nested_parens = format!("int main(void){{ return {}7{}; }}", "(".repeat(256), ")".repeat(256));
+    assert_eq!(compile_and_run("deep", &nested_parens), Ok(7));
+    let blocks = format!("int main(void){{ {}return 9;{} }}", "{".repeat(999), "}".repeat(999));
+    assert_eq!(compile_and_run("deep", &blocks), Ok(9));
+    let mut rungs = String::new();
+    for i in 0..998 { rungs.push_str(&format!("if (x == {i}) return {}; else ", i % 200 + 1)); }
+    let ladder = format!("int f(int x){{ {rungs}return 0; }} int main(void){{ return f(997); }}");
+    assert_eq!(compile_and_run("deep", &ladder), Ok(997 % 200 + 1)); // rung 997 returns 198
+    // 10000 terms: the tallest expression tree that is accepted. 10000 % 256 = 16.
+    let chain = format!("int main(void){{ return {}; }}", vec!["1"; 10_000].join("+"));
+    assert_eq!(compile_and_run("deep", &chain), Ok(16));
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn programs_beyond_the_nesting_limits_are_rejected_not_crashed() {
+    let chain = |n: usize| vec!["1"; n].join("+");
+    let cases = [
+        (format!("int main(void){{ return {}1{}; }}", "(".repeat(257), ")".repeat(257)), "expressions nested too deeply"),
+        (format!("int main(void){{ return {}1; }}", "-".repeat(100_000)), "expressions nested too deeply"),
+        (format!("int f(int x){{ return x; }} int main(void){{ return {}1{}; }}", "f(".repeat(10_000), ")".repeat(10_000)), "expressions nested too deeply"),
+        (format!("int main(void){{ return {}1{}; }}", "(".repeat(1_000_000), ")".repeat(1_000_000)), "expressions nested too deeply"),
+        (format!("int main(void){{ {}return 1;{} }}", "{".repeat(1000), "}".repeat(1000)), "statements nested too deeply"),
+        (format!("int main(void){{ {}return 0; }}", "if (1) ".repeat(100_000)), "statements nested too deeply"),
+        (format!("int main(void){{ {}; return 0; }}", "while (0) ".repeat(50_000)), "statements nested too deeply"),
+        (format!("int main(void){{ return {}; }}", chain(10_001)), "expression too complex"),
+        (format!("int main(void){{ return {}; }}", chain(1_000_000)), "expression too complex"),
+    ];
+    for (i, (source, expected)) in cases.iter().enumerate() {
+        let p = temp_source(&format!("limit{i}"), source);
+        let out = p.with_extension("out");
+        let c = Command::new(env!("CARGO_BIN_EXE_ccc")).arg("-o").arg(&out).arg(&p).output().unwrap();
+        let stderr = String::from_utf8_lossy(&c.stderr);
+        // A clean diagnostic means exit status 1; a stack overflow would be a signal (no code).
+        assert_eq!(c.status.code(), Some(1), "case {i}: {}", &stderr[..stderr.len().min(300)]);
+        assert!(stderr.contains(expected), "case {i}: {}", &stderr[..stderr.len().min(300)]);
+        assert!(!out.exists(), "case {i}: an executable was written for a rejected program");
+        let _ = fs::remove_file(p);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Command line: --dump-ast / --dump-ir / --dump-regalloc
 // ---------------------------------------------------------------------------

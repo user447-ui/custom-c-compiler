@@ -133,8 +133,22 @@ fn run() -> Result<(), String> {
     }
 }
 
+/// Every pass recurses over the AST. The parser limits how tall that tree can get
+/// (`parser::MAX_EXPR_HEIGHT`, `MAX_STATEMENT_NESTING`), and the tallest tree it accepts
+/// needs around 8 MB of stack, which is all a default main thread has (and secondary
+/// threads on some hosts get far less). Run on a thread with a stack that is far larger.
+const STACK_SIZE: usize = 256 * 1024 * 1024;
+
 fn main() {
-    if let Err(e) = run() { eprintln!("ccc: error: {e}"); process::exit(1) }
+    // The stack is only reserved address space; pages are committed as they are touched.
+    let result = match std::thread::Builder::new().stack_size(STACK_SIZE).spawn(run) {
+        Ok(worker) => match worker.join() {
+            Ok(result) => result,
+            Err(_) => process::exit(101), // the panic message has already been printed
+        },
+        Err(_) => run(), // could not reserve the stack (a tight `ulimit -v`): use this thread
+    };
+    if let Err(e) = result { eprintln!("ccc: error: {e}"); process::exit(1) }
 }
 
 #[cfg(test)]
