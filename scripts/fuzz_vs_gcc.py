@@ -6,7 +6,7 @@ Usage: scripts/fuzz_vs_gcc.py target/release/ccc 500 [first_seed]
 Each program has 0-3 helper functions (0-8 int parameters, so both register and
 stack argument passing are exercised) that may call earlier helpers, plus a
 `main` using loops, nested blocks, shadowing and short-circuit operators.
-Constants include values near INT_MAX/INT_MIN and many results are left
+Constants (decimal, hex and octal) include values near INT_MAX/INT_MIN and many results are left
 unbounded, so 32-bit overflow is exercised constantly. gcc is run with -fwrapv,
 which defines signed overflow as wrapping, so the programs have no undefined
 behaviour (division by zero and INT_MIN / -1 are avoided by construction).
@@ -24,8 +24,14 @@ def gen_body(r, counter, params, callables, nstmts, depth):
         counter[0] += 1; return f"{prefix}{counter[0]}"
     BIG = ["2147483647", "2147483646", "(-2147483647 - 1)", "65535", "65536", "46340", "46341",
            "1073741824", "255", "256", "123456789"]
+    def radix(text):
+        # Non-negative literals are sometimes written in hex or octal, which must
+        # mean the same thing to ccc and gcc (`010` is 8, not 10).
+        if not text.isdigit() or r.random() < 0.5: return text
+        n = int(text)
+        return r.choice([f"0x{n:x}", f"0X{n:X}", f"0{n:o}" if n else "0"])
     def literal():
-        return r.choice(BIG) if r.random() < 0.5 else str(r.randint(0, 20))
+        return radix(r.choice(BIG) if r.random() < 0.5 else str(r.randint(0, 20)))
     def bounded(e):
         # Half of the time keep values small, half of the time let them overflow.
         return f"(({e}) % 97)" if r.random() < 0.5 else f"({e})"

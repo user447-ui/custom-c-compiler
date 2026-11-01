@@ -168,6 +168,38 @@ fn rejects_integer_literals_that_do_not_fit_in_int() {
     }
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn octal_and_hexadecimal_literals_match_c() {
+    let programs = [
+        ("octal is base 8", "int main(void){ return 010; }", 8),
+        ("octal 0777", "int main(void){ return 0777 == 511; }", 1),
+        ("zero", "int main(void){ return 0 + 00 + 0x0; }", 0),
+        ("hex", "int main(void){ return 0x2A; }", 42),
+        ("hex upper-case digits and prefix", "int main(void){ return 0XfF == 255; }", 1),
+        ("INT_MAX in hex", "int main(void){ return 0x7fffffff == 2147483647; }", 1),
+        ("INT_MAX in octal", "int main(void){ return 017777777777 == 2147483647; }", 1),
+        ("negated hex", "int main(void){ return -0x10 == -16; }", 1),
+        ("in expressions", "int main(void){ int a = 0x10; int b = 010; return a - b; }", 8),
+    ];
+    for (name, source, want) in programs {
+        assert_eq!(compile_and_run("radix", source), Ok(want), "program '{name}': {source}");
+    }
+    let rejected = [
+        ("int main(void){ return 08; }", "invalid digit '8' in octal"),
+        ("int main(void){ return 0x; }", "no digits"),
+        ("int main(void){ return 0xg; }", "invalid suffix"),
+        ("int main(void){ return 12abc; }", "invalid suffix"),
+        ("int main(void){ return 0x80000000; }", "does not fit in 'int'"),
+        ("int main(void){ return 0xffffffff; }", "does not fit in 'int'"),
+        ("int main(void){ return -0x80000000; }", "does not fit in 'int'"),
+    ];
+    for (source, expected) in rejected {
+        let message = compile_and_run("radix", source).expect_err(source);
+        assert!(message.contains(expected), "{source}: {message}");
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Command line: --dump-ast / --dump-ir / --dump-regalloc
 // ---------------------------------------------------------------------------
