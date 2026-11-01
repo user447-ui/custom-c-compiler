@@ -92,6 +92,56 @@ pub fn promote_locals_to_ssa(module: &mut IrModule) {
     for function in &mut module.functions { promote_function(function); }
 }
 
+/// Immediate dominators of the blocks reachable from `entry` (`None` for `entry` itself and for
+/// unreachable blocks), by Cooper, Harvey and Kennedy, "A Simple, Fast Dominance Algorithm".
+///
+/// Each block's dominators are the chain of `idom` links above it, so memory is linear in the
+/// number of blocks. (Keeping a full dominator *set* per block is quadratic: thousands of
+/// sequential `if`s used to take gigabytes.) Both traversals are iterative, because a function
+/// can have a block chain far longer than the stack could recurse over.
+fn immediate_dominators(
+    entry: BlockId, reachable: &[bool], preds: &[Vec<BlockId>], successors: impl Fn(BlockId) -> Vec<BlockId>,
+) -> Vec<Option<BlockId>> {
+    let n = reachable.len();
+    // Depth-first postorder, children visited in successor order (deterministic).
+    let mut postorder = Vec::with_capacity(n);
+    let mut seen = vec![false; n];
+    let mut stack = vec![(entry, successors(entry), 0usize)];
+    seen[entry] = true;
+    while let Some((block, succs, next)) = stack.last_mut() {
+        if let Some(&succ) = succs.get(*next) {
+            *next += 1;
+            if succ < n && !seen[succ] { seen[succ] = true; stack.push((succ, successors(succ), 0)); }
+        } else {
+            postorder.push(*block);
+            stack.pop();
+        }
+    }
+    let mut number = vec![usize::MAX; n]; // postorder number: the entry has the highest
+    for (i, b) in postorder.iter().enumerate() { number[*b] = i; }
+    let mut idom: Vec<Option<BlockId>> = vec![None; n];
+    idom[entry] = Some(entry);
+    let intersect = |idom: &[Option<BlockId>], mut a: BlockId, mut b: BlockId| {
+        while a != b {
+            while number[a] < number[b] { a = idom[a].expect("processed block has an idom"); }
+            while number[b] < number[a] { b = idom[b].expect("processed block has an idom"); }
+        }
+        a
+    };
+    let mut changed = true;
+    while changed {
+        changed = false;
+        for &b in postorder.iter().rev().filter(|b| **b != entry) {
+            let mut candidates = preds[b].iter().copied().filter(|p| reachable[*p] && idom[*p].is_some());
+            let Some(first) = candidates.next() else { continue };
+            let new_idom = candidates.fold(first, |acc, p| intersect(&idom, p, acc));
+            if idom[b] != Some(new_idom) { idom[b] = Some(new_idom); changed = true; }
+        }
+    }
+    idom[entry] = None;
+    idom
+}
+
 fn promote_function(program: &mut IrFunction) {
     use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
     let n = program.blocks.len();
@@ -117,29 +167,7 @@ fn promote_function(program: &mut IrFunction) {
         reachable[b] = true;
         work.extend(successors(&program.blocks[b]));
     }
-    let universe: HashSet<BlockId> = (0..n).filter(|b| reachable[*b]).collect();
-    let mut dom = vec![HashSet::<BlockId>::new(); n];
-    for b in 0..n {
-        if reachable[b] { dom[b] = if b == program.entry { [b].into_iter().collect() } else { universe.clone() }; }
-    }
-    loop {
-        let mut changed = false;
-        for b in 0..n {
-            if !reachable[b] || b == program.entry { continue; }
-            let incoming: Vec<_> = preds[b].iter().copied().filter(|p| reachable[*p]).collect();
-            let mut next = if let Some(first) = incoming.first() { dom[*first].clone() } else { HashSet::new() };
-            for p in incoming.iter().skip(1) { next.retain(|d| dom[*p].contains(d)); }
-            next.insert(b);
-            if next != dom[b] { dom[b] = next; changed = true; }
-        }
-        if !changed { break; }
-    }
-    let mut idom = vec![None; n];
-    for b in 0..n {
-        if reachable[b] && b != program.entry {
-            idom[b] = dom[b].iter().copied().filter(|d| *d != b).max_by_key(|d| dom[*d].len());
-        }
-    }
+    let idom = immediate_dominators(program.entry, &reachable, &preds, |b| successors(&program.blocks[b]));
     let mut children = vec![Vec::<BlockId>::new(); n];
     for b in 0..n { if let Some(parent) = idom[b] { children[parent].push(b); } }
     // Ordered collections: the order phi nodes are created in decides value numbers and the
@@ -190,11 +218,13 @@ fn promote_function(program: &mut IrFunction) {
         }
         value
     }
+    /// Rename one block and return the variables whose version stacks it pushed to, so the
+    /// caller can pop them once the block's whole subtree of the dominator tree is done.
     fn rename_block(
-        b: BlockId, program: &mut IrFunction, children: &[Vec<BlockId>],
+        b: BlockId, program: &mut IrFunction,
         phi_vars: &HashMap<ValueId, String>, stacks: &mut HashMap<String, Vec<ValueId>>,
-        aliases: &mut HashMap<ValueId, ValueId>, out_versions: &mut [HashMap<String, ValueId>],
-    ) {
+        aliases: &mut HashMap<ValueId, ValueId>, phi_operands: &mut HashMap<(BlockId, ValueId), ValueId>,
+    ) -> Vec<String> {
         let mut pushed = Vec::<String>::new();
         let original = std::mem::take(&mut program.blocks[b].instructions);
         let mut rewritten = Vec::with_capacity(original.len());
@@ -243,27 +273,46 @@ fn promote_function(program: &mut IrFunction) {
                 other => other,
             });
         }
-        for (name, stack) in stacks.iter() {
-            if let Some(value) = stack.last() { out_versions[b].insert(name.clone(), *value); }
+        // The value each variable has at the end of this block is the operand along this edge
+        // of the variable's phi in every successor. Recording just those operands (instead of
+        // a snapshot of every variable per block) keeps memory proportional to the phis.
+        for succ in successors(&program.blocks[b]) {
+            for inst in &program.blocks[succ].instructions {
+                let Instruction::Phi { dst, .. } = inst else { continue };
+                let Some(name) = phi_vars.get(dst) else { continue };
+                if let Some(value) = stacks.get(name).and_then(|s| s.last()) { phi_operands.insert((b, *dst), *value); }
+            }
         }
-        for child in children[b].clone() {
-            rename_block(child, program, children, phi_vars, stacks, aliases, out_versions);
-        }
-        for name in pushed.into_iter().rev() {
-            if let Some(stack) = stacks.get_mut(&name) { stack.pop(); }
-        }
+        pushed
     }
     let mut stacks = HashMap::<String, Vec<ValueId>>::new();
     let mut aliases = HashMap::<ValueId, ValueId>::new();
-    let mut out_versions = vec![HashMap::<String, ValueId>::new(); n];
-    rename_block(program.entry, program, &children, &phi_vars, &mut stacks, &mut aliases, &mut out_versions);
+    let mut phi_operands = HashMap::<(BlockId, ValueId), ValueId>::new();
+    // Depth-first over the dominator tree with an explicit stack: its depth is the length of a
+    // chain of blocks, which is as long as the function (a few thousand `if`s in a row).
+    enum Step { Enter(BlockId), Leave(Vec<String>) }
+    let mut work = vec![Step::Enter(program.entry)];
+    while let Some(step) = work.pop() {
+        match step {
+            Step::Enter(b) => {
+                let pushed = rename_block(b, program, &phi_vars, &mut stacks, &mut aliases, &mut phi_operands);
+                work.push(Step::Leave(pushed));
+                work.extend(children[b].iter().rev().map(|c| Step::Enter(*c)));
+            }
+            Step::Leave(pushed) => {
+                for name in pushed.into_iter().rev() {
+                    if let Some(stack) = stacks.get_mut(&name) { stack.pop(); }
+                }
+            }
+        }
+    }
     for b in 0..n {
-        let incoming_preds = preds[b].clone();
         for inst in &mut program.blocks[b].instructions {
             if let Instruction::Phi { dst, incoming } = inst {
-                if let Some(name) = phi_vars.get(dst) {
-                    *incoming = incoming_preds.iter().filter_map(|pred| {
-                        out_versions[*pred].get(name).copied().map(|v| (*pred, v))
+                if phi_vars.contains_key(dst) {
+                    // Predecessors that never define the variable (or are unreachable) contribute nothing.
+                    *incoming = preds[b].iter().filter_map(|pred| {
+                        phi_operands.get(&(*pred, *dst)).map(|v| (*pred, *v))
                     }).collect();
                 } else {
                     for (_, value) in incoming.iter_mut() { *value = resolve(*value, &aliases); }
@@ -716,5 +765,98 @@ mod tests {
             while(i<5){ if(i<2){a=a+b;b=b+c;} else {c=c+d;d=d+e;e=e+a;} i=i+1;} return a+b+c+d+e;}";
         let first = promoted(source);
         for round in 0..40 { assert_eq!(promoted(source), first, "round {round} differs"); }
+    }
+    // ---- dominators -------------------------------------------------------------------
+
+    /// The textbook definition, kept as an oracle: iterate dominator *sets* to a fixed point,
+    /// then the immediate dominator is the strict dominator with the most dominators.
+    fn dominators_by_sets(entry: usize, succs: &[Vec<usize>]) -> Vec<Option<usize>> {
+        use std::collections::HashSet;
+        let n = succs.len();
+        let mut reachable = vec![false; n];
+        let mut work = vec![entry];
+        while let Some(b) = work.pop() {
+            if reachable[b] { continue; }
+            reachable[b] = true;
+            work.extend(succs[b].iter().copied());
+        }
+        let mut preds = vec![Vec::new(); n];
+        for (b, ss) in succs.iter().enumerate() { for &t in ss { preds[t].push(b); } }
+        let all: HashSet<usize> = (0..n).filter(|b| reachable[*b]).collect();
+        let mut dom: Vec<HashSet<usize>> = (0..n).map(|b| if b == entry { [b].into() } else { all.clone() }).collect();
+        loop {
+            let mut changed = false;
+            for b in (0..n).filter(|b| reachable[*b] && *b != entry) {
+                let mut next: HashSet<usize> = all.clone();
+                for p in preds[b].iter().filter(|p| reachable[**p]) { next.retain(|d| dom[*p].contains(d)); }
+                next.insert(b);
+                if next != dom[b] { dom[b] = next; changed = true; }
+            }
+            if !changed { break; }
+        }
+        (0..n).map(|b| if !reachable[b] || b == entry { None }
+            else { dom[b].iter().copied().filter(|d| *d != b).max_by_key(|d| dom[*d].len()) }).collect()
+    }
+    fn idoms(entry: usize, succs: &[Vec<usize>]) -> Vec<Option<usize>> {
+        let n = succs.len();
+        let mut reachable = vec![false; n];
+        let mut work = vec![entry];
+        while let Some(b) = work.pop() {
+            if reachable[b] { continue; }
+            reachable[b] = true;
+            work.extend(succs[b].iter().copied());
+        }
+        let mut preds = vec![Vec::new(); n];
+        for (b, ss) in succs.iter().enumerate() { for &t in ss { if !preds[t].contains(&b) { preds[t].push(b); } } }
+        immediate_dominators(entry, &reachable, &preds, |b| succs[b].clone())
+    }
+    #[test] fn dominators_of_simple_shapes() {
+        // diamond: 0 -> 1,2 -> 3
+        assert_eq!(idoms(0, &[vec![1, 2], vec![3], vec![3], vec![]]), vec![None, Some(0), Some(0), Some(0)]);
+        // loop with exit: 0 -> 1 -> 2 -> 1, 1 -> 3
+        assert_eq!(idoms(0, &[vec![1], vec![2, 3], vec![1], vec![]]), vec![None, Some(0), Some(1), Some(1)]);
+        // a self-loop and a back edge to the entry block
+        assert_eq!(idoms(0, &[vec![1], vec![1, 2], vec![0]]), vec![None, Some(0), Some(1)]);
+        // unreachable blocks have no dominator, and do not disturb the others
+        assert_eq!(idoms(0, &[vec![2], vec![2], vec![]]), vec![None, None, Some(0)]);
+        // a single block
+        assert_eq!(idoms(0, &[vec![]]), vec![None]);
+    }
+    #[test] fn dominators_match_the_set_based_definition_on_random_graphs() {
+        // A small xorshift generator keeps the test deterministic without a dependency.
+        let mut state = 0x2545_f491_4f6c_dd1du64;
+        let mut next = move |bound: usize| { state ^= state << 13; state ^= state >> 7; state ^= state << 17; (state % bound as u64) as usize };
+        for _ in 0..3000 {
+            let n = 1 + next(14);
+            // Includes irreducible graphs, which the language cannot produce but the
+            // algorithm must still handle.
+            let succs: Vec<Vec<usize>> = (0..n).map(|_| (0..next(3)).map(|_| next(n)).collect()).collect();
+            let entry = next(n);
+            assert_eq!(idoms(entry, &succs), dominators_by_sets(entry, &succs), "entry {entry}, graph {succs:?}");
+        }
+    }
+    #[test] fn dominators_of_a_very_long_chain_need_no_recursion_and_little_memory() {
+        // 200000 blocks in a row: the dominator *sets* of this graph hold about 2 * 10^10
+        // entries, the idom links 200000. The traversal must not recurse per block either.
+        let n = 200_000;
+        let succs: Vec<Vec<usize>> = (0..n).map(|b| if b + 1 < n { vec![b + 1] } else { vec![] }).collect();
+        let idom = idoms(0, &succs);
+        assert_eq!(idom[0], None);
+        assert!((1..n).all(|b| idom[b] == Some(b - 1)));
+    }
+    #[test] fn many_sequential_ifs_and_many_locals_compile_in_linear_space() {
+        // Each `if` adds blocks, each declaration a variable. Per-block dominator sets or
+        // per-block snapshots of every variable made this quadratic (gigabytes at ~8000).
+        let n = 3000;
+        let mut source = String::from("int main(void){ int x = 1; int y = 0; ");
+        for i in 0..n { source.push_str(&format!("int a{i} = x + {i}; if (a{i} % 3) y = y + a{i}; ")); }
+        source.push_str("return y % 256; }");
+        let mut module = lower(&sema::analyze(&Parser::new(lex(&source).unwrap()).parse().unwrap()).unwrap());
+        promote_locals_to_ssa(&mut module);
+        let f = &module.functions[0];
+        assert!(f.blocks.len() > 3 * n);
+        // every local was promoted: nothing reads or writes memory any more
+        assert!(f.blocks.iter().flat_map(|b| &b.instructions)
+            .all(|i| !matches!(i, Instruction::LoadLocal { .. } | Instruction::StoreLocal { .. })));
     }
 }

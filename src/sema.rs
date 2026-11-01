@@ -71,7 +71,7 @@ impl Analyzer {
             None => None,
             Some(body) => {
                 let resolved = self.statements(body)?;
-                let mut flow = Flow { initialized: params.iter().cloned().collect() };
+                let mut flow = Flow { uninitialized: HashSet::new() };
                 flow.statements(&resolved)?;
                 Some(resolved)
             }
@@ -152,7 +152,13 @@ impl Analyzer {
     }
 }
 
-struct Flow { initialized: HashSet<String> }
+/// Definite-assignment state. It tracks the variables that are declared but *not* definitely
+/// initialized (parameters never are), rather than the initialized ones: that set is almost
+/// always tiny, while the initialized set holds every local, and it is copied at every
+/// `if` and loop, so a long function with many locals took time quadratic in its size.
+/// Local names are unique after name resolution, so a name that goes out of scope inside a
+/// branch and lingers in the set can never be read.
+struct Flow { uninitialized: HashSet<String> }
 impl Flow {
     fn statements(&mut self, ss: &[Stmt]) -> Result<(), String> {
         for s in ss { self.statement(s)?; }
@@ -163,32 +169,32 @@ impl Flow {
         match s {
             Stmt::Declaration { name, initializer } => {
                 // The initializer is evaluated before this declaration becomes initialized.
-                self.initialized.remove(name);
-                if let Some(e) = initializer { self.expr(e)?; self.initialized.insert(name.clone()); }
+                self.uninitialized.insert(name.clone());
+                if let Some(e) = initializer { self.expr(e)?; self.uninitialized.remove(name); }
             }
             Stmt::Assignment { name, value } => {
                 self.expr(value)?;
-                self.initialized.insert(name.clone());
+                self.uninitialized.remove(name);
             }
             Stmt::Return(e) | Stmt::Expr(e) => self.expr(e)?,
             Stmt::Block(body) => self.statements(body)?,
             Stmt::If { condition, then_branch, else_branch } => {
                 self.expr(condition)?;
-                let incoming = self.initialized.clone();
-                let mut then_flow = Flow { initialized: incoming.clone() };
+                let mut then_flow = Flow { uninitialized: self.uninitialized.clone() };
                 then_flow.statement(then_branch)?;
-                let mut else_flow = Flow { initialized: incoming.clone() };
+                let mut else_flow = Flow { uninitialized: std::mem::take(&mut self.uninitialized) };
                 if let Some(other) = else_branch {
                     else_flow.statement(other)?;
                 }
-                self.initialized = then_flow.initialized.intersection(&else_flow.initialized)
-                    .cloned().collect();
+                // Initialized after the `if` only if initialized on both paths.
+                self.uninitialized = then_flow.uninitialized;
+                self.uninitialized.extend(else_flow.uninitialized);
             }
             Stmt::While { condition, body } => {
                 self.expr(condition)?;
                 // A loop may execute zero times, so body assignments cannot establish
                 // definite initialization after the loop. Still validate reads in it.
-                let mut body_flow = Flow { initialized: self.initialized.clone() };
+                let mut body_flow = Flow { uninitialized: self.uninitialized.clone() };
                 body_flow.statement(body)?;
             }
         }
@@ -199,7 +205,7 @@ impl Flow {
         match e {
             Expr::Number(_) => Ok(()),
             Expr::Variable(name) => {
-                if self.initialized.contains(name) { Ok(()) }
+                if !self.uninitialized.contains(name) { Ok(()) }
                 else {
                     let source_name = name.split('#').next().unwrap_or(name);
                     Err(format!("read of uninitialized variable '{source_name}'"))

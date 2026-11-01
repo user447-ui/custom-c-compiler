@@ -247,6 +247,30 @@ fn programs_beyond_the_nesting_limits_are_rejected_not_crashed() {
     }
 }
 
+/// Big functions must not need memory (or time) quadratic in their size. 6000 locals and
+/// 6000 `if`s make about 18000 blocks: per-block dominator sets or per-block snapshots of every
+/// variable needed gigabytes, so the compiler runs under a 900 MB address-space limit.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn large_functions_compile_in_bounded_memory() {
+    let n = 6000;
+    let mut source = String::from("int main(void){ int x = 1; int y = 0; ");
+    let mut expected = 0i64;
+    for i in 0..n {
+        source.push_str(&format!("int a{i} = x + {i}; if (a{i} % 3) y = y + a{i}; "));
+        if (1 + i) % 3 != 0 { expected += 1 + i; }
+    }
+    source.push_str("return y % 251; }");
+    let src = temp_source("bigfn", &source);
+    let out = src.with_extension("out");
+    let compiled = Command::new("sh").arg("-c").arg("ulimit -v 900000 && exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_ccc")).arg("-o").arg(&out).arg(&src).output().unwrap();
+    assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+    assert_eq!(Command::new(&out).status().unwrap().code(), Some((expected % 251) as i32));
+    let _ = fs::remove_file(src);
+    let _ = fs::remove_file(out);
+}
+
 // ---------------------------------------------------------------------------
 // Command line: --dump-ast / --dump-ir / --dump-regalloc
 // ---------------------------------------------------------------------------
