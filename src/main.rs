@@ -14,6 +14,8 @@ usage: ccc [options] INPUT.c
                          opt      after optimization (the default)
   --dump-regalloc      like --dump-ir=opt, annotating every value with its
                        register or spill slot and live range
+  -Werror              treat warnings (for example a division by zero that is
+                       certain to run) as errors
   --version
   -h, --help
 
@@ -30,6 +32,7 @@ struct Options {
     dump_ast: bool,
     dump_ir: Option<IrStage>,
     dump_regalloc: bool,
+    werror: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -38,7 +41,7 @@ enum Command { Version, Help, Compile(Options) }
 fn parse_args(args: &[String]) -> Result<Command, String> {
     let (mut input, mut output) = (None::<String>, None::<String>);
     let mut target = Target::DEFAULT;
-    let (mut dump_ast, mut dump_ir, mut dump_regalloc) = (false, None, false);
+    let (mut dump_ast, mut dump_ir, mut dump_regalloc, mut werror) = (false, None, false, false);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -55,6 +58,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             "--dump-ir=lowered" => dump_ir = Some(IrStage::Lowered),
             "--dump-ir=ssa" => dump_ir = Some(IrStage::Ssa),
             "--dump-regalloc" => dump_regalloc = true,
+            "-Werror" => werror = true,
             other if other.starts_with("--dump-ir=") => {
                 return Err(format!("unknown IR stage '{}' (expected lowered, ssa or opt)", &other["--dump-ir=".len()..]));
             }
@@ -74,7 +78,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     if output.is_none() && !dump_ast && dump_ir.is_none() {
         return Err("nothing to do: give -o OUTPUT or a --dump option".into());
     }
-    Ok(Command::Compile(Options { input, output, target, dump_ast, dump_ir, dump_regalloc }))
+    Ok(Command::Compile(Options { input, output, target, dump_ast, dump_ir, dump_regalloc, werror }))
 }
 
 /// `rbx  live [12, 40]` style comment for the value defined by an instruction.
@@ -109,6 +113,12 @@ fn compile(options: &Options) -> Result<(), String> {
         } else {
             print!("{}", irdump::module_to_string(&module, &no_notes));
         }
+    }
+    let warnings = ir::warnings(&module);
+    for warning in &warnings { eprintln!("ccc: warning: {warning}"); }
+    if options.werror && !warnings.is_empty() {
+        return Err(format!("{} warning{} treated as {} (-Werror)", warnings.len(),
+            if warnings.len() == 1 { "" } else { "s" }, if warnings.len() == 1 { "an error" } else { "errors" }));
     }
     let Some(output) = &options.output else { return Ok(()) };
     let machine_code = backend::generate(&*backend, options.target.os, &module)?;
@@ -199,6 +209,12 @@ mod tests {
         assert!(parse(&["--target=aarch64-linux", "-o", "x", "a.c"]).unwrap_err().contains("unsupported architecture 'aarch64'"));
         assert!(parse(&["--target=x86_64-windows", "-o", "x", "a.c"]).unwrap_err().contains("unsupported operating system 'windows'"));
         assert!(parse(&["a.c", "--target"]).unwrap_err().contains("needs a value"));
+    }
+    #[test] fn werror_option() {
+        assert!(!compile_options(&["-o", "x", "a.c"]).werror);
+        assert!(compile_options(&["-Werror", "-o", "x", "a.c"]).werror);
+        assert!(compile_options(&["-o", "x", "a.c", "-Werror"]).werror);
+        assert!(compile_options(&["-Werror", "--dump-ir", "a.c"]).werror);
     }
     #[test] fn version_and_help() {
         assert_eq!(parse(&["--version"]).unwrap(), Command::Version);

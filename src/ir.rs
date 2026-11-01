@@ -381,6 +381,34 @@ fn optimize_function(mut program: IrFunction) -> IrFunction {
     program
 }
 
+/// Warnings about code that is certain to fault if it runs: an integer division or remainder
+/// whose divisor is always 0, or `INT_MIN / -1` (which overflows, and traps on x86 like division
+/// by zero). Meant for the optimized IR, where unreachable blocks are gone, so a division
+/// that a constant condition guards (`if (d != 0) x / d` with `d` known to be 0) is not
+/// reported. Constants are looked up across blocks (every value is defined exactly once), so
+/// `int z = 0; return 1 / z;` is caught as well as `1 / 0`.
+pub fn warnings(module: &IrModule) -> Vec<String> {
+    let mut out = Vec::new();
+    for function in &module.functions {
+        let constants: std::collections::HashMap<ValueId, i32> = function.blocks.iter()
+            .flat_map(|b| &b.instructions)
+            .filter_map(|i| match i { Instruction::Const { dst, value } => Some((*dst, *value)), _ => None })
+            .collect();
+        for inst in function.blocks.iter().flat_map(|b| &b.instructions) {
+            let Instruction::Binary { op: op @ (IrBinary::Div | IrBinary::Rem), lhs, rhs, .. } = inst else { continue };
+            let (what, symbol) = if *op == IrBinary::Div { ("division", '/') } else { ("remainder", '%') };
+            match (constants.get(lhs).copied(), constants.get(rhs).copied()) {
+                (_, Some(0)) => out.push(format!(
+                    "in function '{}': integer {what} by zero; the program crashes if this runs", function.name)),
+                (Some(i32::MIN), Some(-1)) => out.push(format!(
+                    "in function '{}': INT_MIN {symbol} -1 overflows; the program crashes if this runs", function.name)),
+                _ => {}
+            }
+        }
+    }
+    out
+}
+
 fn simplify_constant_branches(program: &mut IrFunction) {
     for block in &mut program.blocks {
         let mut constants = std::collections::HashMap::<ValueId, i32>::new();
@@ -858,5 +886,45 @@ mod tests {
         // every local was promoted: nothing reads or writes memory any more
         assert!(f.blocks.iter().flat_map(|b| &b.instructions)
             .all(|i| !matches!(i, Instruction::LoadLocal { .. } | Instruction::StoreLocal { .. })));
+    }
+    // ---- warnings for divisions that always fault -----------------------------------------
+    fn warnings_for(source: &str) -> Vec<String> {
+        let ast = Parser::new(lex(source).unwrap()).parse().unwrap();
+        let mut module = lower(&sema::analyze(&ast).unwrap());
+        promote_locals_to_ssa(&mut module);
+        warnings(&optimize(module))
+    }
+    #[test] fn warns_about_division_and_remainder_by_zero() {
+        let w = warnings_for("int main(void){ return 1 / 0; }");
+        assert_eq!(w, vec!["in function 'main': integer division by zero; the program crashes if this runs"]);
+        assert!(warnings_for("int main(void){ return 7 % 0; }")[0].contains("remainder by zero"));
+        // the divisor is only known to be zero after folding
+        assert_eq!(warnings_for("int main(void){ return 5 / (3 - 3); }").len(), 1);
+        assert_eq!(warnings_for("int main(void){ return 5 % (2 * 0); }").len(), 1);
+    }
+    #[test] fn warns_when_a_variable_is_known_to_be_zero() {
+        assert_eq!(warnings_for("int main(void){ int z = 0; return 10 / z; }").len(), 1);
+        // the constant crosses a block boundary
+        assert_eq!(warnings_for("int f(int a){ int z = 0; if (a) { a = a + 1; } return a / z; } int main(void){ return f(1); }").len(), 1);
+    }
+    #[test] fn warns_once_per_division_and_names_the_function() {
+        let w = warnings_for("int f(int a){ return a / 0 + a % 0; } int g(int a){ return a / 0; } int main(void){ return f(1) + g(2); }");
+        assert_eq!(w.len(), 3);
+        assert!(w[0].contains("'f'") && w[1].contains("'f'") && w[2].contains("'g'"));
+    }
+    #[test] fn warns_about_signed_division_overflow() {
+        let w = warnings_for("int main(void){ return (-2147483647 - 1) / -1; }");
+        assert_eq!(w, vec!["in function 'main': INT_MIN / -1 overflows; the program crashes if this runs"]);
+        assert!(warnings_for("int main(void){ return (-2147483647 - 1) % -1; }")[0].contains("INT_MIN % -1"));
+    }
+    #[test] fn does_not_warn_about_ordinary_or_guarded_divisions() {
+        assert!(warnings_for("int main(void){ return 10 / 3 + 10 % 3 + 4 / -1; }").is_empty());
+        assert!(warnings_for("int f(int a, int b){ return a / b + a % b; } int main(void){ return f(6, 3); }").is_empty());
+        assert!(warnings_for("int main(void){ return (-2147483647 - 1) / 2 + (-2147483647 - 1) % 3; }").is_empty());
+        // a zero that cannot reach the division: the branch is decided at compile time
+        assert!(warnings_for("int main(void){ int d = 0; if (d != 0) { return 10 / d; } return 1; }").is_empty());
+        assert!(warnings_for("int main(void){ int d = 0; while (d) { d = 5 / d; } return 1; }").is_empty());
+        // a zero in one branch only is not certain
+        assert!(warnings_for("int f(int a){ int d = 1; if (a) { d = 0; } return 4 / d; } int main(void){ return f(0); }").is_empty());
     }
 }

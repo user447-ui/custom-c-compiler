@@ -271,6 +271,55 @@ fn large_functions_compile_in_bounded_memory() {
     let _ = fs::remove_file(out);
 }
 
+/// Compile `source` with `flags`; returns (exit code, stderr, whether the output file exists)
+/// and, when `run` is set and the compile worked, how the built program ended.
+fn compile_with_flags(tag: &str, source: &str, flags: &[&str], run: bool) -> (Option<i32>, String, bool, Option<std::process::ExitStatus>) {
+    let src = temp_source(tag, source);
+    let out = src.with_extension("out");
+    let compiled = Command::new(env!("CARGO_BIN_EXE_ccc")).args(flags).arg("-o").arg(&out).arg(&src).output().unwrap();
+    let exists = out.exists();
+    let ended = (run && exists).then(|| Command::new(&out).status().unwrap());
+    let _ = fs::remove_file(src);
+    let _ = fs::remove_file(out);
+    (compiled.status.code(), String::from_utf8_lossy(&compiled.stderr).into_owned(), exists, ended)
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn certain_division_faults_are_warned_about() {
+    use std::os::unix::process::ExitStatusExt;
+    let cases = [
+        ("literal", "int main(void){ return 1 / 0; }", "integer division by zero"),
+        ("remainder", "int main(void){ return 7 % 0; }", "integer remainder by zero"),
+        ("folded", "int main(void){ return 9 / (4 - 4); }", "integer division by zero"),
+        ("variable", "int main(void){ int z = 0; return 10 / z; }", "integer division by zero"),
+        ("other function", "int f(int a){ return a % 0; } int main(void){ return f(1); }", "in function 'f'"),
+        ("int min", "int main(void){ return (-2147483647 - 1) / -1; }", "INT_MIN / -1 overflows"),
+    ];
+    for (name, source, expected) in cases {
+        // A warning only: the program is still built, and it does fault (SIGFPE) when run.
+        let (code, stderr, built, ended) = compile_with_flags("divwarn", source, &[], true);
+        assert_eq!(code, Some(0), "{name}: {stderr}");
+        assert!(built, "{name}: no executable was written");
+        assert!(stderr.contains("ccc: warning: ") && stderr.contains(expected), "{name}: {stderr}");
+        assert_eq!(ended.unwrap().signal(), Some(8), "{name}: expected SIGFPE");
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn werror_turns_the_warning_into_a_failure_and_clean_code_is_silent() {
+    let bad = "int main(void){ int z = 0; return 1 / z; }";
+    let (code, stderr, built, _) = compile_with_flags("werror", bad, &["-Werror"], false);
+    assert_eq!(code, Some(1), "{stderr}");
+    assert!(stderr.contains("warning: ") && stderr.contains("1 warning treated as an error (-Werror)"), "{stderr}");
+    assert!(!built, "-Werror must not leave an executable behind");
+    let good = "int f(int a, int b){ return a / b + a % b; } int main(void){ int d = 0; if (d != 0) { return 10 / d; } return f(7, 2); }";
+    let (code, stderr, built, _) = compile_with_flags("werror", good, &["-Werror"], false);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert!(built && !stderr.contains("warning"), "{stderr}");
+}
+
 // ---------------------------------------------------------------------------
 // Command line: --dump-ast / --dump-ir / --dump-regalloc
 // ---------------------------------------------------------------------------
