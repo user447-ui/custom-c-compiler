@@ -80,7 +80,10 @@ fn compile_function(program: &IrFunction) -> Result<FunctionCode, String> {
 
     // Phi assignments are edge-specific. Redirect only those edges through
     // tiny copy blocks so a conditional branch never executes the other edge's copies.
+    // (A `Vec` keeps the order the edges are found in, which fixes the code layout; the set
+    // makes the "already have it" test constant time, as there is one edge per phi per branch.)
     let mut edge_trampolines = Vec::<(BlockId, BlockId)>::new();
+    let mut known_edges = std::collections::HashSet::<(BlockId, BlockId)>::new();
     for block in &program.blocks {
         let mut targets = Vec::new();
         match block.terminator {
@@ -94,7 +97,7 @@ fn compile_function(program: &IrFunction) -> Result<FunctionCode, String> {
         for target in targets {
             let needs_copy = program.blocks.get(target).is_some_and(|b| b.instructions.iter().any(|i|
                 matches!(i, Instruction::Phi { incoming, .. } if incoming.iter().any(|(pred, _)| *pred == block.id))));
-            if needs_copy && !edge_trampolines.contains(&(block.id, target)) {
+            if needs_copy && known_edges.insert((block.id, target)) {
                 edge_trampolines.push((block.id, target));
             }
         }

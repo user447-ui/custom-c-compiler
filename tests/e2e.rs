@@ -397,6 +397,29 @@ fn dump_ast_shows_positions() {
     let _ = fs::remove_file(src);
 }
 
+/// Register allocation must not need memory quadratic in (values live across blocks) x
+/// (blocks): 3000 values that stay live through 3000 branches (about 9000 blocks) took over
+/// a gigabyte as per-block sets of live values, so run the compiler under a 600 MB limit.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn many_long_lived_values_over_many_branches_compile_in_bounded_memory() {
+    let n = 3000;
+    let mut source = String::from("int main(void){ int y = 0; ");
+    for i in 0..n { source.push_str(&format!("int a{i} = {i} + y; ")); }
+    for _ in 0..n { source.push_str("if (y < 1) { y = y + 1; } "); }
+    let sum = (0..n).map(|i| format!("a{i}")).collect::<Vec<_>>().join("+");
+    source.push_str(&format!("return ({sum}) % 251; }}"));
+    let src = temp_source("longlive", &source);
+    let out = src.with_extension("out");
+    let compiled = Command::new("sh").arg("-c").arg("ulimit -v 600000 && exec \"$0\" \"$@\"")
+        .arg(env!("CARGO_BIN_EXE_ccc")).arg("-o").arg(&out).arg(&src).output().unwrap();
+    assert!(compiled.status.success(), "{}", String::from_utf8_lossy(&compiled.stderr));
+    let expected = (0..n).sum::<i64>() % 251;
+    assert_eq!(Command::new(&out).status().unwrap().code(), Some(expected as i32));
+    let _ = fs::remove_file(src);
+    let _ = fs::remove_file(out);
+}
+
 // ---------------------------------------------------------------------------
 // Command line: --dump-ast / --dump-ir / --dump-regalloc
 // ---------------------------------------------------------------------------
