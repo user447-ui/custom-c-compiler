@@ -1,4 +1,4 @@
-mod ast; mod backend; mod diag; mod ir; mod irdump; mod lexer; mod object; mod parser; mod regalloc; mod sema; mod target;
+mod ast; mod backend; mod diag; mod ir; mod lint; mod irdump; mod lexer; mod object; mod parser; mod regalloc; mod sema; mod target;
 use std::{env, fs, process};
 use diag::{Diagnostic, Severity, SourceMap};
 use target::Target;
@@ -15,8 +15,9 @@ usage: ccc [options] INPUT.c
                          opt      after optimization (the default)
   --dump-regalloc      like --dump-ir=opt, annotating every value with its
                        register or spill slot and live range
-  -Werror              treat warnings (for example a division by zero that is
-                       certain to run) as errors
+  -Werror              treat warnings (an unused variable, a division by zero
+                       that is certain to run, ...) as errors
+  -w                   do not print warnings
   --version
   -h, --help
 
@@ -34,6 +35,7 @@ struct Options {
     dump_ir: Option<IrStage>,
     dump_regalloc: bool,
     werror: bool,
+    no_warnings: bool,
 }
 
 #[derive(Debug, PartialEq)]
@@ -42,7 +44,7 @@ enum Command { Version, Help, Compile(Options) }
 fn parse_args(args: &[String]) -> Result<Command, String> {
     let (mut input, mut output) = (None::<String>, None::<String>);
     let mut target = Target::DEFAULT;
-    let (mut dump_ast, mut dump_ir, mut dump_regalloc, mut werror) = (false, None, false, false);
+    let (mut dump_ast, mut dump_ir, mut dump_regalloc, mut werror, mut no_warnings) = (false, None, false, false, false);
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -60,6 +62,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
             "--dump-ir=ssa" => dump_ir = Some(IrStage::Ssa),
             "--dump-regalloc" => dump_regalloc = true,
             "-Werror" => werror = true,
+            "-w" => no_warnings = true,
             other if other.starts_with("--dump-ir=") => {
                 return Err(format!("unknown IR stage '{}' (expected lowered, ssa or opt)", &other["--dump-ir=".len()..]));
             }
@@ -79,7 +82,7 @@ fn parse_args(args: &[String]) -> Result<Command, String> {
     if output.is_none() && !dump_ast && dump_ir.is_none() {
         return Err("nothing to do: give -o OUTPUT or a --dump option".into());
     }
-    Ok(Command::Compile(Options { input, output, target, dump_ast, dump_ir, dump_regalloc, werror }))
+    Ok(Command::Compile(Options { input, output, target, dump_ast, dump_ir, dump_regalloc, werror, no_warnings }))
 }
 
 /// `rbx  live [12, 40]` style comment for the value defined by an instruction.
@@ -122,7 +125,11 @@ fn compile(options: &Options) -> Result<(), Failure> {
             print!("{}", irdump::module_to_string(&module, &no_notes));
         }
     }
-    let warnings = ir::warnings(&module);
+    // Warnings from the AST and from the optimized IR, in the order of the source (the ones
+    // with no position last). The sort is stable, so equal positions keep this order.
+    let mut warnings = if options.no_warnings { Vec::new() } else { lint::warnings(&program) };
+    if !options.no_warnings { warnings.extend(ir::warnings(&module)); }
+    warnings.sort_by_key(|w| (w.pos.is_none(), w.pos));
     for warning in &warnings { eprintln!("{}", sources.render(Severity::Warning, warning)); }
     if options.werror && !warnings.is_empty() {
         return Err(Failure::Message(format!("{} warning{} treated as {} (-Werror)", warnings.len(),
@@ -227,6 +234,11 @@ mod tests {
         assert!(compile_options(&["-Werror", "-o", "x", "a.c"]).werror);
         assert!(compile_options(&["-o", "x", "a.c", "-Werror"]).werror);
         assert!(compile_options(&["-Werror", "--dump-ir", "a.c"]).werror);
+    }
+    #[test] fn no_warnings_option() {
+        assert!(!compile_options(&["-o", "x", "a.c"]).no_warnings);
+        assert!(compile_options(&["-w", "-o", "x", "a.c"]).no_warnings);
+        assert!(compile_options(&["-o", "x", "-w", "a.c", "-Werror"]).no_warnings);
     }
     #[test] fn version_and_help() {
         assert_eq!(parse(&["--version"]).unwrap(), Command::Version);

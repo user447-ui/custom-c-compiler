@@ -156,10 +156,10 @@ impl Parser {
             }
             TokenKind::Ident(s)=>(Expr::Variable(s, t.pos),1),
             TokenKind::LParen=>{let r=self.nested(Nesting::Expressions, |p| p.expr_with_height(0))?;self.expect(TokenKind::RParen)?;r},
-            TokenKind::Plus=>self.unary(UnaryOp::Plus)?,
-            TokenKind::Minus=>self.unary(UnaryOp::Minus)?,
-            TokenKind::Tilde=>self.unary(UnaryOp::BitNot)?,
-            TokenKind::Bang=>self.unary(UnaryOp::LogicalNot)?,
+            TokenKind::Plus=>self.unary(UnaryOp::Plus, t.pos)?,
+            TokenKind::Minus=>self.unary(UnaryOp::Minus, t.pos)?,
+            TokenKind::Tilde=>self.unary(UnaryOp::BitNot, t.pos)?,
+            TokenKind::Bang=>self.unary(UnaryOp::LogicalNot, t.pos)?,
             x=>return Err(Diagnostic::at(t.pos, format!("expected expression, got {}", Self::describe(&x)))),
         };
         loop {
@@ -191,9 +191,9 @@ impl Parser {
         }
         Ok((lhs, height))
     }
-    fn unary(&mut self, op: UnaryOp) -> Result<(Expr, usize), Diagnostic> {
+    fn unary(&mut self, op: UnaryOp, pos: Pos) -> Result<(Expr, usize), Diagnostic> {
         let (operand, height)=self.nested(Nesting::Expressions, |p| p.expr_with_height(19))?;
-        Ok((Expr::Unary { op, expr: Box::new(operand) }, height+1))
+        Ok((Expr::Unary { op, expr: Box::new(operand), pos }, height+1))
     }
 }
 fn is_keyword(s: &str) -> bool { matches!(s, "int" | "void" | "return" | "if" | "else" | "while") }

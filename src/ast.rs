@@ -1,7 +1,7 @@
 use crate::diag::Pos;
 
 /// Positions: where the thing is named or operated in the source, for diagnostics. A function,
-/// declaration, assignment or call is positioned at its name, a binary operation at its operator.
+/// declaration, assignment or call is positioned at its name, a unary or binary operation at its operator.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Program { pub functions: Vec<Function> }
 /// A function definition (`body` is `Some`) or a prototype (`body` is `None`).
@@ -23,7 +23,7 @@ pub enum Stmt {
 pub enum Expr {
     Number(i64, Pos),
     Variable(String, Pos),
-    Unary { op: UnaryOp, expr: Box<Expr> },
+    Unary { op: UnaryOp, expr: Box<Expr>, pos: Pos },
     Binary { op: BinaryOp, left: Box<Expr>, right: Box<Expr>, pos: Pos },
     Call { name: String, args: Vec<Expr>, pos: Pos },
 }

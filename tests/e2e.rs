@@ -420,6 +420,41 @@ fn many_long_lived_values_over_many_branches_compile_in_bounded_memory() {
     let _ = fs::remove_file(out);
 }
 
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn unused_variables_and_useless_statements_are_warned_about_in_source_order() {
+    let source = "int twice(int n) {\n    int spare = 0;\n    return n * 2;\n}\n\nint main(void) {\n    int z = 0;\n    int total;\n    total = 1;\n    twice(3);\n    z + 1;\n    return 5 / z;\n}\n";
+    let (code, stderr) = compiler_output("lint", source, &[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    // AST warnings and the IR warning (the division) come out together, ordered by position
+    assert_eq!(stderr, "\
+t.c:2:9: warning: unused variable 'spare'\n    int spare = 0;\n        ^\n\
+t.c:8:9: warning: variable 'total' is set but never used\n    int total;\n        ^\n\
+t.c:11:7: warning: statement has no effect\n    z + 1;\n      ^\n\
+t.c:12:14: warning: in function 'main': integer division by zero; the program crashes if this runs\n    return 5 / z;\n             ^\n\
+ccc: emitted native x86-64 ELF executable: t.out\n");
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn warnings_can_be_silenced_or_made_fatal() {
+    let source = "int main(void) {\n    int a = 1;\n    int b = 2;\n    b;\n    return a;\n}\n";
+    // -w: nothing but the usual note
+    let (code, stderr) = compiler_output("lintw", source, &["-w"]);
+    assert_eq!((code, stderr.as_str()), (Some(0), "ccc: emitted native x86-64 ELF executable: t.out\n"));
+    // -Werror counts every warning (here two: `b;` has no effect, and b is only "used" by it)
+    let (code, stderr) = compiler_output("lintw", source, &["-Werror"]);
+    assert_eq!(code, Some(1));
+    assert!(stderr.contains("warning: statement has no effect") && stderr.ends_with("ccc: error: 1 warning treated as an error (-Werror)\n"), "{stderr}");
+    // -w wins: with no warnings, -Werror has nothing to object to
+    let (code, stderr) = compiler_output("lintw", source, &["-Werror", "-w"]);
+    assert_eq!((code, stderr.as_str()), (Some(0), "ccc: emitted native x86-64 ELF executable: t.out\n"));
+    // a program with nothing to warn about is silent
+    let clean = "int gcd(int a, int b) {\n    while (b) {\n        int t = b;\n        b = a % b;\n        a = t;\n    }\n    return a;\n}\nint main(void) { return gcd(12, 18); }\n";
+    let (code, stderr) = compiler_output("lintw", clean, &["-Werror"]);
+    assert_eq!((code, stderr.as_str()), (Some(0), "ccc: emitted native x86-64 ELF executable: t.out\n"));
+}
+
 // ---------------------------------------------------------------------------
 // Command line: --dump-ast / --dump-ir / --dump-regalloc
 // ---------------------------------------------------------------------------

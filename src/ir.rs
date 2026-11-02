@@ -636,7 +636,7 @@ impl Builder {
             Expr::Variable(name, _) => {
                 let dst = self.value(); self.emit(Instruction::LoadLocal { dst, name: name.clone() }); dst
             }
-            Expr::Unary { op, expr } => {
+            Expr::Unary { op, expr, .. } => {
                 let src = self.expression(expr); let dst = self.value();
                 let op = match op {
                     UnaryOp::Plus => IrUnary::Plus, UnaryOp::Minus => IrUnary::Negate,

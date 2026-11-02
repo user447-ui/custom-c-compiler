@@ -124,7 +124,7 @@ impl Analyzer {
     fn expr(&mut self, e: &Expr) -> Result<Expr, Diagnostic> {
         Ok(match e {
             // `-2147483648` is the one literal that only fits once the minus is applied.
-            Expr::Unary { op: UnaryOp::Minus, expr } if matches!(**expr, Expr::Number(n, _) if n == 1 << 31) => {
+            Expr::Unary { op: UnaryOp::Minus, expr, .. } if matches!(**expr, Expr::Number(n, _) if n == 1 << 31) => {
                 let Expr::Number(_, pos) = **expr else { unreachable!() };
                 Expr::Number(i64::from(i32::MIN), pos)
             }
@@ -135,7 +135,7 @@ impl Analyzer {
                 Expr::Number(*n, *pos)
             }
             Expr::Variable(n, pos) => Expr::Variable(self.resolve(n, *pos)?, *pos),
-            Expr::Unary { op, expr } => Expr::Unary { op: *op, expr: Box::new(self.expr(expr)?) },
+            Expr::Unary { op, expr, pos } => Expr::Unary { op: *op, expr: Box::new(self.expr(expr)?), pos: *pos },
             Expr::Binary { op, left, right, pos } => Expr::Binary {
                 op: *op, left: Box::new(self.expr(left)?), right: Box::new(self.expr(right)?), pos: *pos
             },
