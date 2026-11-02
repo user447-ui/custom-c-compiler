@@ -301,7 +301,7 @@ fn certain_division_faults_are_warned_about() {
         let (code, stderr, built, ended) = compile_with_flags("divwarn", source, &[], true);
         assert_eq!(code, Some(0), "{name}: {stderr}");
         assert!(built, "{name}: no executable was written");
-        assert!(stderr.contains("ccc: warning: ") && stderr.contains(expected), "{name}: {stderr}");
+        assert!(stderr.contains(": warning: ") && stderr.contains(expected), "{name}: {stderr}");
         assert_eq!(ended.unwrap().signal(), Some(8), "{name}: expected SIGFPE");
     }
 }
@@ -318,6 +318,83 @@ fn werror_turns_the_warning_into_a_failure_and_clean_code_is_silent() {
     let (code, stderr, built, _) = compile_with_flags("werror", good, &["-Werror"], false);
     assert_eq!(code, Some(0), "{stderr}");
     assert!(built && !stderr.contains("warning"), "{stderr}");
+}
+
+/// What `ccc` prints for `source`, with the temporary file's path replaced by `t.c`.
+#[cfg(unix)]
+fn compiler_output(tag: &str, source: &str, flags: &[&str]) -> (Option<i32>, String) {
+    let src = temp_source(tag, source);
+    let out = src.with_extension("out");
+    let run = Command::new(env!("CARGO_BIN_EXE_ccc")).args(flags).arg("-o").arg(&out).arg(&src).output().unwrap();
+    let stderr = String::from_utf8_lossy(&run.stderr).replace(src.to_str().unwrap(), "t.c").replace(out.to_str().unwrap(), "t.out");
+    let _ = fs::remove_file(src);
+    let _ = fs::remove_file(out);
+    (run.status.code(), stderr)
+}
+
+#[cfg(unix)]
+#[test]
+fn errors_show_file_line_column_the_source_line_and_a_caret() {
+    let cases: [(&str, &str); 9] = [
+        ("int main(void) {\n    return 1 +;\n}\n",
+         "t.c:2:15: error: expected expression, got ';'\n    return 1 +;\n              ^\n"),
+        // a missing `;` is shown after the last token of the statement, not on the next line
+        ("int main(void) {\n    int x = 5\n    return x;\n}\n",
+         "t.c:2:14: error: expected ';', got 'return'\n    int x = 5\n             ^\n"),
+        ("int main(void) {\n    return y;\n}\n",
+         "t.c:2:12: error: use of undeclared variable 'y'\n    return y;\n           ^\n"),
+        ("int main(void) {\n    int a = 1;\n    int a = 2;\n    return a;\n}\n",
+         "t.c:3:9: error: redeclaration of local variable 'a' in the same scope\n    int a = 2;\n        ^\n"),
+        // tabs are copied into the caret line, so it lines up whatever the tab width
+        ("int main(void) {\n\tint x;\n\treturn x + 1;\n}\n",
+         "t.c:3:9: error: read of uninitialized variable 'x'\n\treturn x + 1;\n\t       ^\n"),
+        ("int f(int a);\nint main(void) {\n    return f(1, 2);\n}\n",
+         "t.c:3:12: error: function 'f' expects 1 argument(s), got 2\n    return f(1, 2);\n           ^\n"),
+        ("int main(void) {\n    return 08;\n}\n",
+         "t.c:2:12: error: invalid digit '8' in octal literal '08'\n    return 08;\n           ^\n"),
+        // the unclosed block is shown where it opens, not at the end of the file
+        ("int main(void) {\n    if (1) {\n        return 0;\n",
+         "t.c:2:12: error: unterminated block: this '{' is never closed before the end of input\n    if (1) {\n           ^\n"),
+        // an error about the program as a whole has no location
+        ("int f(void) { return 0; }\n", "ccc: error: program has no 'main' function\n"),
+    ];
+    for (i, (source, expected)) in cases.iter().enumerate() {
+        let (code, stderr) = compiler_output("diag", source, &[]);
+        assert_eq!(code, Some(1), "case {i}");
+        assert_eq!(&stderr, expected, "case {i}");
+    }
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[test]
+fn warnings_show_the_location_of_the_operator() {
+    let source = "int main(void) {\n    int z = 0;\n    return 10 / z;\n}\n";
+    let (code, stderr) = compiler_output("warnpos", source, &[]);
+    assert_eq!(code, Some(0), "{stderr}");
+    assert_eq!(stderr, "t.c:3:15: warning: in function 'main': integer division by zero; the program crashes if this runs\n    return 10 / z;\n              ^\nccc: emitted native x86-64 ELF executable: t.out\n");
+    // -Werror: the same warning, then the failure
+    let (code, stderr) = compiler_output("warnpos", source, &["-Werror"]);
+    assert_eq!(code, Some(1));
+    assert!(stderr.starts_with("t.c:3:15: warning: ") && stderr.ends_with("ccc: error: 1 warning treated as an error (-Werror)\n"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
+fn input_with_windows_line_endings_and_non_ascii_text_is_located_correctly() {
+    // CRLF line endings, and a multi-byte character before the error: the column counts
+    // characters, and the shown line has no stray carriage return.
+    let source = "int main(void) {\r\n    /* é */ return q;\r\n}\r\n";
+    let (_, stderr) = compiler_output("crlf", source, &[]);
+    assert_eq!(stderr, "t.c:2:20: error: use of undeclared variable 'q'\n    /* é */ return q;\n                   ^\n");
+}
+
+#[test]
+fn dump_ast_shows_positions() {
+    let src = temp_source("astpos", "int main(void) {\n  return 6 / 3;\n}\n");
+    let (ok, text, _) = run_ccc(&["--dump-ast", src.to_str().unwrap()]);
+    assert!(ok, "{text}");
+    assert!(text.contains("pos: 1:5") && text.contains("pos: 2:12"), "{text}"); // main; the `/`
+    let _ = fs::remove_file(src);
 }
 
 // ---------------------------------------------------------------------------

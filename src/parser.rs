@@ -1,4 +1,5 @@
 use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, UnaryOp};
+use crate::diag::{Diagnostic, Pos};
 use crate::lexer::{Token, TokenKind};
 
 /// How deeply statements may nest (blocks and `if`/`else`/`while` bodies; an `else if`
@@ -24,41 +25,61 @@ impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self { Self { tokens, pos: 0, depth: [0; 2] } }
     /// Run `f` one level deeper in `kind`, failing instead of recursing without bound.
     /// (On an error the parse is abandoned, so the counter need not be restored.)
-    fn nested<T>(&mut self, kind: Nesting, f: impl FnOnce(&mut Self) -> Result<T, String>) -> Result<T, String> {
+    fn nested<T>(&mut self, kind: Nesting, f: impl FnOnce(&mut Self) -> Result<T, Diagnostic>) -> Result<T, Diagnostic> {
         if self.depth[kind as usize] >= kind.limit() {
-            return Err(format!("at character {}: {} nested too deeply (the limit is {} levels)",
-                self.tokens[self.pos].offset, kind.noun(), kind.limit()));
+            return Err(Diagnostic::at(self.here(), format!("{} nested too deeply (the limit is {} levels)", kind.noun(), kind.limit())));
         }
         self.depth[kind as usize] += 1;
         let result = f(self);
         self.depth[kind as usize] -= 1;
         result
     }
+    /// Where the next token is (the end of input, once everything has been taken).
+    fn here(&self) -> Pos { self.tokens[self.pos.min(self.tokens.len() - 1)].pos }
+    fn describe(kind: &TokenKind) -> String { kind.describe(is_keyword) }
     fn peek(&self) -> &TokenKind { &self.tokens[self.pos].kind }
     fn peek2(&self) -> &TokenKind { &self.tokens[(self.pos + 1).min(self.tokens.len() - 1)].kind }
     fn take(&mut self) -> Token { let t=self.tokens[self.pos].clone(); self.pos+=1; t }
-    fn expect(&mut self, k: TokenKind) -> Result<(), String> {
-        let t=self.take(); if t.kind==k { Ok(()) } else { Err(format!("at character {}: expected {k:?}, got {:?}",t.offset,t.kind)) }
+    fn expect(&mut self, k: TokenKind) -> Result<(), Diagnostic> {
+        let t=self.take();
+        if t.kind==k { return Ok(()) }
+        // A missing `;` or `)` is best shown right after the last token that was there, not at
+        // whatever starts the next line.
+        let at = match self.pos.checked_sub(2).map(|i| &self.tokens[i]) {
+            Some(previous) if previous.end.line < t.pos.line => previous.end,
+            _ => t.pos,
+        };
+        Err(Diagnostic::at(at, format!("expected {}, got {}", Self::describe(&k), Self::describe(&t.kind))))
     }
-    fn ident(&mut self, s: &str) -> Result<(), String> {
-        let t=self.take(); if t.kind==TokenKind::Ident(s.into()) { Ok(()) } else { Err(format!("at character {}: expected {s}, got {:?}",t.offset,t.kind)) }
+    fn ident(&mut self, s: &str) -> Result<(), Diagnostic> {
+        let t=self.take();
+        if t.kind==TokenKind::Ident(s.into()) { Ok(()) }
+        else { Err(Diagnostic::at(t.pos, format!("expected '{s}', got {}", Self::describe(&t.kind)))) }
     }
-    fn name(&mut self) -> Result<String, String> {
+    fn name(&mut self) -> Result<String, Diagnostic> { self.name_at().map(|(name, _)| name) }
+    /// An identifier that is not a keyword, with its position.
+    fn name_at(&mut self) -> Result<(String, Pos), Diagnostic> {
         let t=self.take();
         match t.kind {
-            TokenKind::Ident(s) if is_keyword(&s) => Err(format!("at character {}: '{s}' is a keyword and cannot be used as a name",t.offset)),
-            TokenKind::Ident(s) => Ok(s),
-            other => Err(format!("at character {}: expected identifier, got {other:?}",t.offset)),
+            TokenKind::Ident(s) if is_keyword(&s) => Err(Diagnostic::at(t.pos, format!("'{s}' is a keyword and cannot be used as a name"))),
+            TokenKind::Ident(s) => Ok((s, t.pos)),
+            other => Err(Diagnostic::at(t.pos, format!("expected identifier, got {}", Self::describe(&other)))),
         }
     }
-    pub fn parse(mut self) -> Result<Program, String> {
+    pub fn parse(mut self) -> Result<Program, Diagnostic> {
         let mut functions = Vec::new();
         while *self.peek() != TokenKind::End { functions.push(self.function()?); }
         Ok(Program { functions })
     }
     /// `int name(int a, int b) { ... }` or a prototype `int name(int a, int b);`.
-    fn function(&mut self) -> Result<Function, String> {
-        self.ident("int")?; let name=self.name()?; self.expect(TokenKind::LParen)?;
+    fn function(&mut self) -> Result<Function, Diagnostic> {
+        self.ident("int")?; let (name, pos)=self.name_at()?;
+        if *self.peek()!=TokenKind::LParen {
+            return Err(Diagnostic::at(self.here(), format!(
+                "expected '(' after '{name}', got {}: only functions can be defined at file scope (global variables are not supported)",
+                Self::describe(self.peek()))));
+        }
+        self.take();
         let mut params=Vec::new();
         if *self.peek()==TokenKind::Ident("void".into()) && *self.peek2()==TokenKind::RParen {
             self.take();
@@ -70,24 +91,26 @@ impl Parser {
         }
         self.expect(TokenKind::RParen)?;
         let body = if *self.peek()==TokenKind::Semicolon { self.take(); None } else { Some(self.block()?) };
-        Ok(Function { name, params, body })
+        Ok(Function { name, params, body, pos })
     }
-    fn block(&mut self) -> Result<Vec<Stmt>, String> {
-        self.expect(TokenKind::LBrace)?; let mut v=Vec::new();
+    fn block(&mut self) -> Result<Vec<Stmt>, Diagnostic> {
+        let open=self.here(); self.expect(TokenKind::LBrace)?; let mut v=Vec::new();
         while *self.peek()!=TokenKind::RBrace {
-            if *self.peek()==TokenKind::End { return Err("unterminated block".into()); }
+            if *self.peek()==TokenKind::End {
+                return Err(Diagnostic::at(open, "unterminated block: this '{' is never closed before the end of input"));
+            }
             v.push(self.statement()?);
         }
         self.expect(TokenKind::RBrace)?; Ok(v)
     }
-    fn statement(&mut self) -> Result<Stmt, String> { self.nested(Nesting::Statements, Self::statement_unchecked) }
-    fn statement_unchecked(&mut self) -> Result<Stmt, String> {
+    fn statement(&mut self) -> Result<Stmt, Diagnostic> { self.nested(Nesting::Statements, Self::statement_unchecked) }
+    fn statement_unchecked(&mut self) -> Result<Stmt, Diagnostic> {
         match self.peek() {
             TokenKind::LBrace => Ok(Stmt::Block(self.block()?)),
             TokenKind::Ident(s) if s=="int" => {
-                self.take(); let name=self.name()?;
+                self.take(); let (name, pos)=self.name_at()?;
                 let initializer=if *self.peek()==TokenKind::Equal { self.take(); Some(self.expr(0)?) } else { None };
-                self.expect(TokenKind::Semicolon)?; Ok(Stmt::Declaration { name, initializer })
+                self.expect(TokenKind::Semicolon)?; Ok(Stmt::Declaration { name, initializer, pos })
             }
             TokenKind::Ident(s) if s=="return" => { self.take(); let e=self.expr(0)?; self.expect(TokenKind::Semicolon)?; Ok(Stmt::Return(e)) }
             TokenKind::Ident(s) if s=="if" => {
@@ -101,25 +124,25 @@ impl Parser {
                 Ok(Stmt::While { condition, body: Box::new(self.statement()?) })
             }
             TokenKind::Ident(_) if *self.peek2()==TokenKind::Equal => {
-                let name=self.name()?; self.expect(TokenKind::Equal)?; let value=self.expr(0)?; self.expect(TokenKind::Semicolon)?;
-                Ok(Stmt::Assignment { name, value })
+                let (name, pos)=self.name_at()?; self.expect(TokenKind::Equal)?; let value=self.expr(0)?; self.expect(TokenKind::Semicolon)?;
+                Ok(Stmt::Assignment { name, value, pos })
             }
             TokenKind::Semicolon => { self.take(); Ok(Stmt::Block(Vec::new())) }
             TokenKind::Ident(_) | TokenKind::Number(_) | TokenKind::LParen | TokenKind::Plus
             | TokenKind::Minus | TokenKind::Tilde | TokenKind::Bang => {
                 let e=self.expr(0)?; self.expect(TokenKind::Semicolon)?; Ok(Stmt::Expr(e))
             }
-            x => Err(format!("unexpected token at statement start: {x:?}")),
+            x => Err(Diagnostic::at(self.here(), format!("expected a statement, got {}", Self::describe(x)))),
         }
     }
-    fn expr(&mut self, min: u8) -> Result<Expr, String> { self.expr_with_height(min).map(|(e, _)| e) }
+    fn expr(&mut self, min: u8) -> Result<Expr, Diagnostic> { self.expr_with_height(min).map(|(e, _)| e) }
     /// Like `expr`, also returning the height of the tree (a leaf has height 1).
-    fn expr_with_height(&mut self, min: u8) -> Result<(Expr, usize), String> {
+    fn expr_with_height(&mut self, min: u8) -> Result<(Expr, usize), Diagnostic> {
         let t=self.take();
         let (mut lhs, mut height)=match t.kind {
-            TokenKind::Number(n)=>(Expr::Number(n),1),
+            TokenKind::Number(n)=>(Expr::Number(n, t.pos),1),
             TokenKind::Ident(s) if is_keyword(&s) =>
-                return Err(format!("at character {}: unexpected keyword '{s}' in expression",t.offset)),
+                return Err(Diagnostic::at(t.pos, format!("unexpected keyword '{s}' in expression"))),
             TokenKind::Ident(s) if *self.peek()==TokenKind::LParen => {
                 self.take(); let mut args=Vec::new(); let mut height=1;
                 if *self.peek()!=TokenKind::RParen {
@@ -129,15 +152,15 @@ impl Parser {
                     }
                 }
                 self.expect(TokenKind::RParen)?;
-                (Expr::Call { name: s, args }, height)
+                (Expr::Call { name: s, args, pos: t.pos }, height)
             }
-            TokenKind::Ident(s)=>(Expr::Variable(s),1),
+            TokenKind::Ident(s)=>(Expr::Variable(s, t.pos),1),
             TokenKind::LParen=>{let r=self.nested(Nesting::Expressions, |p| p.expr_with_height(0))?;self.expect(TokenKind::RParen)?;r},
             TokenKind::Plus=>self.unary(UnaryOp::Plus)?,
             TokenKind::Minus=>self.unary(UnaryOp::Minus)?,
             TokenKind::Tilde=>self.unary(UnaryOp::BitNot)?,
             TokenKind::Bang=>self.unary(UnaryOp::LogicalNot)?,
-            x=>return Err(format!("at character {}: expected expression, got {x:?}",t.offset)),
+            x=>return Err(Diagnostic::at(t.pos, format!("expected expression, got {}", Self::describe(&x)))),
         };
         loop {
             let (op,l,r)=match self.peek() {
@@ -159,16 +182,16 @@ impl Parser {
                 TokenKind::Percent=>(BinaryOp::Rem,17,18),
                 _=>break,
             };
-            if l<min { break; } let at=self.take().offset; let (rhs,rhs_height)=self.expr_with_height(r)?;
+            if l<min { break; } let at=self.take().pos; let (rhs,rhs_height)=self.expr_with_height(r)?;
             height=height.max(rhs_height)+1;
             if height > MAX_EXPR_HEIGHT {
-                return Err(format!("at character {at}: expression too complex (more than {MAX_EXPR_HEIGHT} levels of operators)"));
+                return Err(Diagnostic::at(at, format!("expression too complex (more than {MAX_EXPR_HEIGHT} levels of operators)")));
             }
-            lhs=Expr::Binary { op, left:Box::new(lhs), right:Box::new(rhs) };
+            lhs=Expr::Binary { op, left:Box::new(lhs), right:Box::new(rhs), pos: at };
         }
         Ok((lhs, height))
     }
-    fn unary(&mut self, op: UnaryOp) -> Result<(Expr, usize), String> {
+    fn unary(&mut self, op: UnaryOp) -> Result<(Expr, usize), Diagnostic> {
         let (operand, height)=self.nested(Nesting::Expressions, |p| p.expr_with_height(19))?;
         Ok((Expr::Unary { op, expr: Box::new(operand) }, height+1))
     }
@@ -178,7 +201,7 @@ fn is_keyword(s: &str) -> bool { matches!(s, "int" | "void" | "return" | "if" | 
 #[cfg(test)]
 mod tests {
     use super::*; use crate::lexer::lex;
-    fn parse(src: &str) -> Result<Program, String> { Parser::new(lex(src).unwrap()).parse() }
+    fn parse(src: &str) -> Result<Program, Diagnostic> { Parser::new(lex(src).unwrap()).parse() }
     fn main_body(p: &Program) -> &Vec<Stmt> { p.functions[0].body.as_ref().unwrap() }
     #[test] fn parses_statements() { let p=parse("int main(){int x=1;while(x-5)x=x+1;return x;}").unwrap(); assert_eq!(main_body(&p).len(),3); }
     #[test] fn parses_precedence() { let p=parse("int main(){return 1+2<4 && !0;}").unwrap(); assert_eq!(main_body(&p).len(),1); }
@@ -202,6 +225,80 @@ mod tests {
         assert!(parse("int main(){int return=1;return 0;}").is_err());
         assert!(parse("int main(int while){return 0;}").is_err());
         assert!(parse("int main(){else;}").is_err());
+    }
+    // ---- positions in diagnostics and the AST ----------------------------------------------
+    use crate::diag::locate;
+    fn fails_at(source: &str) -> (Pos, String) {
+        let d = parse(source).unwrap_err();
+        (d.pos.expect("a parse error has a position"), d.message)
+    }
+    #[test] fn a_missing_semicolon_is_reported_right_after_the_previous_token() {
+        let source = "int main(){\n  int x = 5\n  return x;\n}";
+        let (pos, message) = fails_at(source);
+        assert_eq!(pos, Pos { line: 2, col: 12 }); // just after the 5, not at `return` on line 3
+        assert_eq!(message, "expected ';', got 'return'");
+        // on the same line the offending token itself is shown
+        let (pos, _) = fails_at("int main(){ return 1 2; }");
+        assert_eq!(pos, locate("int main(){ return 1 2; }", "2", 1));
+        // and at the end of input, after the last token
+        assert_eq!(fails_at("int main(){ return 1").0, Pos { line: 1, col: 21 });
+    }
+    #[test] fn a_missing_closing_parenthesis_is_reported_after_the_expression() {
+        let (pos, message) = fails_at("int main(){\n  return (1 + 2\n}");
+        assert_eq!(pos, Pos { line: 2, col: 16 }); // just after the `2`
+        assert_eq!(message, "expected ')', got '}'");
+    }
+    #[test] fn error_messages_name_tokens_the_way_c_does() {
+        assert_eq!(fails_at("int main(){ return 1 +; }").1, "expected expression, got ';'");
+        assert_eq!(fails_at("int main(){ int 5; }").1, "expected identifier, got number 5");
+        assert_eq!(fails_at("int main(){ int while; }").1, "'while' is a keyword and cannot be used as a name");
+        assert_eq!(fails_at("int main(){ return @; }").1, "expected expression, got '@'");
+        assert_eq!(fails_at("int main(){ ) }").1, "expected a statement, got ')'");
+        assert_eq!(fails_at("main(){}").1, "expected 'int', got identifier 'main'");
+    }
+    #[test] fn each_error_is_positioned_at_the_offending_token() {
+        for (source, needle) in [
+            ("int main(){ return 1 +; }", ";"),
+            ("int main(){ int 5; }", "5"),
+            ("int main(){ ) }", ") }"),
+            ("int main(){ return else; }", "else"),
+            ("int main(){ return f(1,); }", ");"),
+        ] {
+            assert_eq!(fails_at(source).0, locate(source, needle, 1), "{source}");
+        }
+    }
+    #[test] fn an_unclosed_block_is_reported_at_its_opening_brace() {
+        let source = "int main(void) {\n  if (1) {\n    return 0;\n";
+        let (pos, message) = fails_at(source);
+        assert_eq!(pos, locate(source, "{", 2));
+        assert!(message.starts_with("unterminated block"), "{message}");
+    }
+    #[test] fn a_global_variable_gets_an_explanation() {
+        let (pos, message) = fails_at("int counter;\nint main(){}");
+        assert_eq!(pos, Pos { line: 1, col: 12 });
+        assert!(message.contains("global variables are not supported"), "{message}");
+    }
+    #[test] fn nesting_limit_errors_are_positioned_too() {
+        on_big_stack(|| {
+            let source = in_main(&format!("return {}1{};", "(".repeat(MAX_EXPR_NESTING + 1), ")".repeat(MAX_EXPR_NESTING + 1)));
+            assert!(parse(&source).unwrap_err().pos.is_some());
+            let chain = in_main(&format!("return {};", vec!["1"; MAX_EXPR_HEIGHT + 1].join("+")));
+            assert!(parse(&chain).unwrap_err().pos.is_some());
+        });
+    }
+    #[test] fn the_ast_records_where_things_are() {
+        let source = "int f(int a) { return a; }\nint main(void) {\n  int x = f(1) / 2;\n  x = x + 1;\n  return x;\n}";
+        let p = parse(source).unwrap();
+        assert_eq!(p.functions[0].pos, locate(source, "f", 1));
+        assert_eq!(p.functions[1].pos, locate(source, "main", 1));
+        let body = p.functions[1].body.as_ref().unwrap();
+        let Stmt::Declaration { pos, initializer: Some(Expr::Binary { pos: op, left, .. }), .. } = &body[0] else { panic!("{:?}", body[0]) };
+        assert_eq!(*pos, locate(source, "x", 1)); // the declared name
+        assert_eq!(*op, locate(source, "/", 1)); // a binary operation is at its operator
+        assert!(matches!(**left, Expr::Call { pos, .. } if pos == locate(source, "f(1", 1))); // a call at its name
+        let Stmt::Assignment { pos, value: Expr::Binary { left, .. }, .. } = &body[1] else { panic!() };
+        assert_eq!(*pos, locate(source, "x = x", 1));
+        assert!(matches!(**left, Expr::Variable(_, pos) if pos == locate(source, "x + 1", 1)));
     }
     #[test] fn rejects_trailing_comma_in_params() { assert!(parse("int f(int a,){return a;}").is_err()); }
     /// Debug builds have large frames and test threads small stacks: run on a big one.

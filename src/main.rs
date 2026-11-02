@@ -1,5 +1,6 @@
-mod ast; mod backend; mod ir; mod irdump; mod lexer; mod object; mod parser; mod regalloc; mod sema; mod target;
+mod ast; mod backend; mod diag; mod ir; mod irdump; mod lexer; mod object; mod parser; mod regalloc; mod sema; mod target;
 use std::{env, fs, process};
+use diag::{Diagnostic, Severity, SourceMap};
 use target::Target;
 
 const USAGE: &str = "\
@@ -94,12 +95,19 @@ fn allocation_comment(backend: &dyn backend::Backend, function: &ir::IrFunction,
     })
 }
 
-fn compile(options: &Options) -> Result<(), String> {
+/// Why `ccc` stops: either a plain message, printed as `ccc: error: ...`, or a problem that has
+/// already been printed (a diagnostic with a source location).
+enum Failure { Message(String), Reported }
+impl From<String> for Failure { fn from(message: String) -> Self { Failure::Message(message) } }
+
+fn compile(options: &Options) -> Result<(), Failure> {
     let source = fs::read_to_string(&options.input).map_err(|e| format!("cannot read {}: {e}", options.input))?;
-    let tokens = lexer::lex(&source)?;
-    let parsed = parser::Parser::new(tokens).parse()?;
+    let sources = SourceMap::new(&options.input, &source);
+    let fail = |d: Diagnostic| { eprintln!("{}", sources.render(Severity::Error, &d)); Failure::Reported };
+    let tokens = lexer::lex(&source).map_err(fail)?;
+    let parsed = parser::Parser::new(tokens).parse().map_err(fail)?;
     if options.dump_ast { println!("{parsed:#?}"); }
-    let program = sema::analyze(&parsed)?;
+    let program = sema::analyze(&parsed).map_err(fail)?;
     let backend = backend::for_target(&options.target);
     let mut module = ir::lower(&program);
     let no_notes = |_: &ir::IrFunction, _: ir::ValueId| None;
@@ -115,10 +123,10 @@ fn compile(options: &Options) -> Result<(), String> {
         }
     }
     let warnings = ir::warnings(&module);
-    for warning in &warnings { eprintln!("ccc: warning: {warning}"); }
+    for warning in &warnings { eprintln!("{}", sources.render(Severity::Warning, warning)); }
     if options.werror && !warnings.is_empty() {
-        return Err(format!("{} warning{} treated as {} (-Werror)", warnings.len(),
-            if warnings.len() == 1 { "" } else { "s" }, if warnings.len() == 1 { "an error" } else { "errors" }));
+        return Err(Failure::Message(format!("{} warning{} treated as {} (-Werror)", warnings.len(),
+            if warnings.len() == 1 { "" } else { "s" }, if warnings.len() == 1 { "an error" } else { "errors" })));
     }
     let Some(output) = &options.output else { return Ok(()) };
     let machine_code = backend::generate(&*backend, options.target.os, &module)?;
@@ -134,7 +142,7 @@ fn compile(options: &Options) -> Result<(), String> {
     Ok(())
 }
 
-fn run() -> Result<(), String> {
+fn run() -> Result<(), Failure> {
     let args: Vec<String> = env::args().skip(1).collect();
     match parse_args(&args).map_err(|e| format!("{e}\n{USAGE}"))? {
         Command::Version => { println!("ccc {} ({})", env!("CARGO_PKG_VERSION"), Target::DEFAULT.triple()); Ok(()) }
@@ -158,7 +166,11 @@ fn main() {
         },
         Err(_) => run(), // could not reserve the stack (a tight `ulimit -v`): use this thread
     };
-    if let Err(e) = result { eprintln!("ccc: error: {e}"); process::exit(1) }
+    match result {
+        Ok(()) => {}
+        Err(Failure::Message(e)) => { eprintln!("ccc: error: {e}"); process::exit(1) }
+        Err(Failure::Reported) => process::exit(1),
+    }
 }
 
 #[cfg(test)]

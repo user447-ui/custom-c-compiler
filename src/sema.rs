@@ -1,12 +1,13 @@
 use std::collections::{HashMap, HashSet};
 use crate::ast::{Expr, Function, Program, Stmt, UnaryOp};
+use crate::diag::{Diagnostic, Pos};
 
 /// Resolve identifiers and validate declarations while preserving lexical scope,
 /// check function declarations and calls, then reject reads of locals that are
 /// not definitely initialized.
-pub fn analyze(program: &Program) -> Result<Program, String> {
+pub fn analyze(program: &Program) -> Result<Program, Diagnostic> {
     let mut analyzer = Analyzer {
-        scopes: Vec::new(), next_id: 0, signatures: HashMap::new(), called: HashSet::new(),
+        scopes: Vec::new(), next_id: 0, signatures: HashMap::new(), called: HashMap::new(),
     };
     let mut defined = HashSet::<String>::new();
     let mut functions = Vec::new();
@@ -15,25 +16,26 @@ pub fn analyze(program: &Program) -> Result<Program, String> {
         // functions declared *earlier* are visible (as in C).
         match analyzer.signatures.get(&f.name) {
             Some(arity) if *arity != f.params.len() =>
-                return Err(format!("conflicting declaration of function '{}'", f.name)),
+                return Err(Diagnostic::at(f.pos, format!("conflicting declaration of function '{}'", f.name))),
             _ => {}
         }
         analyzer.signatures.insert(f.name.clone(), f.params.len());
         if f.body.is_some() && !defined.insert(f.name.clone()) {
-            return Err(format!("redefinition of function '{}'", f.name));
+            return Err(Diagnostic::at(f.pos, format!("redefinition of function '{}'", f.name)));
         }
         functions.push(analyzer.function(f)?);
     }
+    let main_pos = program.functions.iter().rev().find(|f| f.name == "main").map(|f| f.pos).unwrap_or_default();
     match analyzer.signatures.get("main") {
         Some(0) if defined.contains("main") => {}
-        Some(0) => return Err("function 'main' is declared but never defined".into()),
-        Some(_) => return Err("'main' must take no parameters".into()),
+        Some(0) => return Err(Diagnostic::at(main_pos, "function 'main' is declared but never defined")),
+        Some(_) => return Err(Diagnostic::at(main_pos, "'main' must take no parameters")),
         None => return Err("program has no 'main' function".into()),
     }
-    let mut missing: Vec<&String> = analyzer.called.iter().filter(|n| !defined.contains(*n)).collect();
+    let mut missing: Vec<(&String, Pos)> = analyzer.called.iter().filter(|(n, _)| !defined.contains(*n)).map(|(n, p)| (n, *p)).collect();
     missing.sort();
-    if let Some(name) = missing.first() {
-        return Err(format!("undefined function '{name}' (declared but never defined)"));
+    if let Some((name, pos)) = missing.first() {
+        return Err(Diagnostic::at(*pos, format!("undefined function '{name}' (declared but never defined)")));
     }
     Ok(Program { functions })
 }
@@ -42,7 +44,8 @@ struct Analyzer {
     scopes: Vec<HashMap<String, String>>,
     next_id: usize,
     signatures: HashMap<String, usize>,
-    called: HashSet<String>,
+    /// Every function that is called, with the position of its first call.
+    called: HashMap<String, Pos>,
 }
 impl Analyzer {
     fn push(&mut self) { self.scopes.push(HashMap::new()); }
@@ -50,18 +53,18 @@ impl Analyzer {
     fn unique(&mut self, name: &str) -> String {
         let unique = format!("{name}#{}", self.next_id); self.next_id += 1; unique
     }
-    fn resolve(&self, name: &str) -> Result<String, String> {
+    fn resolve(&self, name: &str, pos: Pos) -> Result<String, Diagnostic> {
         self.scopes.iter().rev().find_map(|s| s.get(name).cloned())
-            .ok_or_else(|| format!("use of undeclared variable '{name}'"))
+            .ok_or_else(|| Diagnostic::at(pos, format!("use of undeclared variable '{name}'")))
     }
     /// Parameters live in the same scope as the function body's outermost block,
     /// so `int f(int a) { int a; }` is a redeclaration error, as in C.
-    fn function(&mut self, f: &Function) -> Result<Function, String> {
+    fn function(&mut self, f: &Function) -> Result<Function, Diagnostic> {
         self.scopes = vec![HashMap::new()];
         let mut params = Vec::new();
         for p in &f.params {
             if self.scopes[0].contains_key(p) {
-                return Err(format!("duplicate parameter '{p}' in function '{}'", f.name));
+                return Err(Diagnostic::at(f.pos, format!("duplicate parameter '{p}' in function '{}'", f.name)));
             }
             let unique = self.unique(p);
             self.scopes[0].insert(p.clone(), unique.clone());
@@ -77,28 +80,28 @@ impl Analyzer {
             }
         };
         self.scopes.clear();
-        Ok(Function { name: f.name.clone(), params, body })
+        Ok(Function { name: f.name.clone(), params, body, pos: f.pos })
     }
-    fn statements(&mut self, ss: &[Stmt]) -> Result<Vec<Stmt>, String> {
+    fn statements(&mut self, ss: &[Stmt]) -> Result<Vec<Stmt>, Diagnostic> {
         ss.iter().map(|s| self.statement(s)).collect()
     }
-    fn scoped(&mut self, s: &Stmt) -> Result<Stmt, String> {
+    fn scoped(&mut self, s: &Stmt) -> Result<Stmt, Diagnostic> {
         self.push(); let result = self.statement(s); self.pop(); result
     }
-    fn statement(&mut self, s: &Stmt) -> Result<Stmt, String> {
+    fn statement(&mut self, s: &Stmt) -> Result<Stmt, Diagnostic> {
         match s {
-            Stmt::Declaration { name, initializer } => {
+            Stmt::Declaration { name, initializer, pos } => {
                 if self.scopes.last().unwrap().contains_key(name) {
-                    return Err(format!("redeclaration of local variable '{name}' in the same scope"));
+                    return Err(Diagnostic::at(*pos, format!("redeclaration of local variable '{name}' in the same scope")));
                 }
                 let initializer = initializer.as_ref().map(|e| self.expr(e)).transpose()?;
                 let unique = self.unique(name);
                 self.scopes.last_mut().unwrap().insert(name.clone(), unique.clone());
-                Ok(Stmt::Declaration { name: unique, initializer })
+                Ok(Stmt::Declaration { name: unique, initializer, pos: *pos })
             }
-            Stmt::Assignment { name, value } => {
-                let name = self.resolve(name)?; let value = self.expr(value)?;
-                Ok(Stmt::Assignment { name, value })
+            Stmt::Assignment { name, value, pos } => {
+                let name = self.resolve(name, *pos)?; let value = self.expr(value)?;
+                Ok(Stmt::Assignment { name, value, pos: *pos })
             }
             Stmt::Return(e) => Ok(Stmt::Return(self.expr(e)?)),
             Stmt::Expr(e) => Ok(Stmt::Expr(self.expr(e)?)),
@@ -118,35 +121,36 @@ impl Analyzer {
             }
         }
     }
-    fn expr(&mut self, e: &Expr) -> Result<Expr, String> {
+    fn expr(&mut self, e: &Expr) -> Result<Expr, Diagnostic> {
         Ok(match e {
             // `-2147483648` is the one literal that only fits once the minus is applied.
-            Expr::Unary { op: UnaryOp::Minus, expr } if matches!(**expr, Expr::Number(n) if n == 1 << 31) => {
-                Expr::Number(i64::from(i32::MIN))
+            Expr::Unary { op: UnaryOp::Minus, expr } if matches!(**expr, Expr::Number(n, _) if n == 1 << 31) => {
+                let Expr::Number(_, pos) = **expr else { unreachable!() };
+                Expr::Number(i64::from(i32::MIN), pos)
             }
-            Expr::Number(n) => {
+            Expr::Number(n, pos) => {
                 if i32::try_from(*n).is_err() {
-                    return Err(format!("integer literal {n} is too large for 'int' (the maximum is 2147483647)"));
+                    return Err(Diagnostic::at(*pos, format!("integer literal {n} is too large for 'int' (the maximum is 2147483647)")));
                 }
-                Expr::Number(*n)
+                Expr::Number(*n, *pos)
             }
-            Expr::Variable(n) => Expr::Variable(self.resolve(n)?),
+            Expr::Variable(n, pos) => Expr::Variable(self.resolve(n, *pos)?, *pos),
             Expr::Unary { op, expr } => Expr::Unary { op: *op, expr: Box::new(self.expr(expr)?) },
-            Expr::Binary { op, left, right } => Expr::Binary {
-                op: *op, left: Box::new(self.expr(left)?), right: Box::new(self.expr(right)?)
+            Expr::Binary { op, left, right, pos } => Expr::Binary {
+                op: *op, left: Box::new(self.expr(left)?), right: Box::new(self.expr(right)?), pos: *pos
             },
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, pos } => {
                 if self.scopes.iter().any(|s| s.contains_key(name)) {
-                    return Err(format!("called object '{name}' is a variable, not a function"));
+                    return Err(Diagnostic::at(*pos, format!("called object '{name}' is a variable, not a function")));
                 }
                 let arity = *self.signatures.get(name)
-                    .ok_or_else(|| format!("call to undeclared function '{name}'"))?;
+                    .ok_or_else(|| Diagnostic::at(*pos, format!("call to undeclared function '{name}'")))?;
                 if arity != args.len() {
-                    return Err(format!("function '{name}' expects {arity} argument(s), got {}", args.len()));
+                    return Err(Diagnostic::at(*pos, format!("function '{name}' expects {arity} argument(s), got {}", args.len())));
                 }
-                self.called.insert(name.clone());
+                self.called.entry(name.clone()).or_insert(*pos);
                 let args = args.iter().map(|a| self.expr(a)).collect::<Result<Vec<_>, _>>()?;
-                Expr::Call { name: name.clone(), args }
+                Expr::Call { name: name.clone(), args, pos: *pos }
             }
         })
     }
@@ -160,19 +164,19 @@ impl Analyzer {
 /// branch and lingers in the set can never be read.
 struct Flow { uninitialized: HashSet<String> }
 impl Flow {
-    fn statements(&mut self, ss: &[Stmt]) -> Result<(), String> {
+    fn statements(&mut self, ss: &[Stmt]) -> Result<(), Diagnostic> {
         for s in ss { self.statement(s)?; }
         Ok(())
     }
 
-    fn statement(&mut self, s: &Stmt) -> Result<(), String> {
+    fn statement(&mut self, s: &Stmt) -> Result<(), Diagnostic> {
         match s {
-            Stmt::Declaration { name, initializer } => {
+            Stmt::Declaration { name, initializer, .. } => {
                 // The initializer is evaluated before this declaration becomes initialized.
                 self.uninitialized.insert(name.clone());
                 if let Some(e) = initializer { self.expr(e)?; self.uninitialized.remove(name); }
             }
-            Stmt::Assignment { name, value } => {
+            Stmt::Assignment { name, value, .. } => {
                 self.expr(value)?;
                 self.uninitialized.remove(name);
             }
@@ -201,14 +205,14 @@ impl Flow {
         Ok(())
     }
 
-    fn expr(&self, e: &Expr) -> Result<(), String> {
+    fn expr(&self, e: &Expr) -> Result<(), Diagnostic> {
         match e {
-            Expr::Number(_) => Ok(()),
-            Expr::Variable(name) => {
+            Expr::Number(..) => Ok(()),
+            Expr::Variable(name, pos) => {
                 if !self.uninitialized.contains(name) { Ok(()) }
                 else {
                     let source_name = name.split('#').next().unwrap_or(name);
-                    Err(format!("read of uninitialized variable '{source_name}'"))
+                    Err(Diagnostic::at(*pos, format!("read of uninitialized variable '{source_name}'")))
                 }
             }
             Expr::Unary { expr, .. } => self.expr(expr),
@@ -227,7 +231,7 @@ impl Flow {
 mod tests {
     use super::*;
     use crate::{lexer::lex, parser::Parser};
-    fn run(s: &str) -> Result<Program, String> { analyze(&Parser::new(lex(s)?).parse()?) }
+    fn run(s: &str) -> Result<Program, Diagnostic> { analyze(&Parser::new(lex(s)?).parse()?) }
     fn main_body(p: &Program) -> &Vec<Stmt> { p.functions.iter().find(|f| f.name == "main").unwrap().body.as_ref().unwrap() }
 
     #[test] fn rejects_use_before_declaration() {
@@ -314,7 +318,60 @@ mod tests {
     }
     #[test] fn int_min_literal_is_allowed_under_minus() {
         let p = run("int main(){return -2147483648;}").unwrap();
-        assert_eq!(main_body(&p)[0], Stmt::Return(Expr::Number(i64::from(i32::MIN))));
+        assert!(matches!(main_body(&p)[0], Stmt::Return(Expr::Number(n, _)) if n == i64::from(i32::MIN)));
         assert!(run("int main(){return -2147483649;}").is_err());
+    }
+    // ---- positions in diagnostics ----------------------------------------------------------
+    use crate::diag::locate;
+    /// Analyze `source`, expecting an error that carries a position; returns it with the message.
+    fn rejected(source: &str) -> (Pos, String) {
+        let d = run(source).unwrap_err();
+        (d.pos.unwrap_or_else(|| panic!("no position on: {}", d.message)), d.message)
+    }
+    #[test] fn semantic_errors_point_at_the_offending_name() {
+        let cases: [(&str, &str, usize, &str); 12] = [
+            ("int main(void){\n  return y;\n}", "y;", 1, "use of undeclared variable 'y'"),
+            ("int main(void){\n  y = 1;\n  return 0;\n}", "y =", 1, "use of undeclared variable 'y'"),
+            ("int main(void){ int a = 1; int a = 2; return a; }", "a = 2", 1, "redeclaration of local variable 'a'"),
+            ("int main(void){ int x; return x + 1; }", "x + 1", 1, "read of uninitialized variable 'x'"),
+            ("int main(void){ return 3000000000; }", "3000000000", 1, "integer literal 3000000000 is too large"),
+            ("int main(void){ return 1 + 2147483648; }", "2147483648", 1, "too large for 'int'"),
+            ("int f(int a); int main(void){ return f(1, 2); }", "f(1, 2", 1, "function 'f' expects 1 argument(s), got 2"),
+            ("int main(void){ return g(1); }", "g(1", 1, "call to undeclared function 'g'"),
+            ("int main(void){ int f = 1; return f(2); }", "f(2", 1, "called object 'f' is a variable"),
+            ("int f(void){ return 1; }\nint f(void){ return 2; }\nint main(void){ return f(); }", "f(void){ return 2", 1, "redefinition of function 'f'"),
+            ("int f(int a); int f(int a, int b); int main(void){ return 0; }", "f(int a, int b", 1, "conflicting declaration of function 'f'"),
+            ("int f(int a, int a){ return a; } int main(void){ return 0; }", "f(int a, int a", 1, "duplicate parameter 'a'"),
+        ];
+        for (source, needle, nth, message) in cases {
+            let (pos, text) = rejected(source);
+            assert_eq!(pos, locate(source, needle, nth), "{source}");
+            assert!(text.contains(message), "{source}: {text}");
+        }
+    }
+    #[test] fn problems_with_main_and_missing_definitions_are_positioned_where_possible() {
+        let source = "int main(int argc){ return 0; }";
+        assert_eq!(rejected(source).0, locate(source, "main", 1));
+        let source = "int main(void);";
+        assert_eq!(rejected(source).0, locate(source, "main", 1));
+        // a function that is called but never defined is reported at its first call
+        let source = "int f(void);\nint main(void){\n  f();\n  return f();\n}";
+        let (pos, message) = rejected(source);
+        assert_eq!(pos, locate(source, "f();", 1)); // not the later `return f();`
+        assert!(message.contains("undefined function 'f'"), "{message}");
+        // nothing in the source to point at: no position
+        assert_eq!(run("int f(void){ return 1; }").unwrap_err().pos, None);
+    }
+    #[test] fn the_error_inside_a_nested_scope_is_found_at_its_own_line() {
+        let source = "int main(void){\n  int a = 1;\n  while (a) {\n    if (a) {\n      b = 2;\n    }\n  }\n  return 0;\n}";
+        assert_eq!(rejected(source).0, Pos { line: 5, col: 7 });
+    }
+    #[test] fn sema_keeps_positions_in_the_resolved_program() {
+        let source = "int main(void){\n  int x = 4;\n  return x / 2;\n}";
+        let p = run(source).unwrap();
+        let Stmt::Return(Expr::Binary { pos, left, .. }) = &main_body(&p)[1] else { panic!() };
+        assert_eq!(*pos, locate(source, "/", 1));
+        assert!(matches!(**left, Expr::Variable(_, pos) if pos == locate(source, "x /", 1)));
+        assert_eq!(p.functions[0].pos, locate(source, "main", 1));
     }
 }

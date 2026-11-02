@@ -1,3 +1,4 @@
+use crate::diag::{Diagnostic, Pos};
 #[derive(Debug, Clone, PartialEq)]
 pub enum TokenKind {
     Ident(String), Number(i64),
@@ -8,10 +9,40 @@ pub enum TokenKind {
     Plus, Minus, Star, Slash, Percent, End, Other(char),
 }
 #[derive(Debug, Clone, PartialEq)]
-pub struct Token { pub kind: TokenKind, pub offset: usize }
+/// `end` is the position just after the token's last character.
+pub struct Token { pub kind: TokenKind, pub pos: Pos, pub end: Pos }
 
-pub fn lex(source: &str) -> Result<Vec<Token>, String> {
+impl TokenKind {
+    /// How a token is named in diagnostics: `';'`, `identifier 'x'`, `end of input`.
+    /// `keyword` says whether an identifier is reserved (the lexer does not know).
+    pub fn describe(&self, keyword: impl Fn(&str) -> bool) -> String {
+        let symbol = match self {
+            TokenKind::Ident(s) if keyword(s) => return format!("'{s}'"),
+            TokenKind::Ident(s) => return format!("identifier '{s}'"),
+            TokenKind::Number(n) => return format!("number {n}"),
+            TokenKind::End => return "end of input".to_string(),
+            TokenKind::Other(c) => return format!("'{}'", c.escape_debug()),
+            TokenKind::LParen => "(", TokenKind::RParen => ")", TokenKind::LBrace => "{", TokenKind::RBrace => "}",
+            TokenKind::Semicolon => ";", TokenKind::Comma => ",",
+            TokenKind::Equal => "=", TokenKind::EqualEqual => "==", TokenKind::Bang => "!", TokenKind::BangEqual => "!=",
+            TokenKind::Less => "<", TokenKind::LessEqual => "<=", TokenKind::Greater => ">", TokenKind::GreaterEqual => ">=",
+            TokenKind::Amp => "&", TokenKind::AmpAmp => "&&", TokenKind::Pipe => "|", TokenKind::PipePipe => "||",
+            TokenKind::Caret => "^", TokenKind::Tilde => "~",
+            TokenKind::Plus => "+", TokenKind::Minus => "-", TokenKind::Star => "*", TokenKind::Slash => "/", TokenKind::Percent => "%",
+        };
+        format!("'{symbol}'")
+    }
+}
+
+pub fn lex(source: &str) -> Result<Vec<Token>, Diagnostic> {
     let c: Vec<char> = source.chars().collect();
+    // Character offsets at which each line starts, to turn an offset into line and column.
+    let line_starts: Vec<usize> = std::iter::once(0)
+        .chain(c.iter().enumerate().filter(|(_, ch)| **ch == '\n').map(|(i, _)| i + 1)).collect();
+    let pos = |offset: usize| {
+        let line = line_starts.partition_point(|start| *start <= offset);
+        Pos { line: line as u32, col: (offset - line_starts[line - 1] + 1) as u32 }
+    };
     let (mut i, mut out) = (0, Vec::new());
     while i < c.len() {
         let x = c[i];
@@ -25,14 +56,14 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
                 if c[i] == '*' && c[i + 1] == '/' { i += 2; done = true; break; }
                 i += 1;
             }
-            if !done { return Err(format!("unterminated block comment at character {start}")); }
+            if !done { return Err(Diagnostic::at(pos(start), "unterminated block comment")); }
             continue;
         }
         let start = i;
         if x.is_ascii_alphabetic() || x == '_' {
             i += 1;
             while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_') { i += 1; }
-            out.push(Token { kind: TokenKind::Ident(c[start..i].iter().collect()), offset: start });
+            out.push(Token { kind: TokenKind::Ident(c[start..i].iter().collect()), pos: pos(start), end: pos(i) });
             continue;
         }
         if x.is_ascii_digit() {
@@ -41,8 +72,8 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
             i += 1;
             while i < c.len() && (c[i].is_ascii_alphanumeric() || c[i] == '_') { i += 1; }
             let text: String = c[start..i].iter().collect();
-            let value = lex_number(&text).map_err(|e| format!("{e} at character {start}"))?;
-            out.push(Token { kind: TokenKind::Number(value), offset: start });
+            let value = lex_number(&text).map_err(|e| Diagnostic::at(pos(start), e))?;
+            out.push(Token { kind: TokenKind::Number(value), pos: pos(start), end: pos(i) });
             continue;
         }
         let pair = if i + 1 < c.len() { Some((x, c[i + 1])) } else { None };
@@ -55,7 +86,7 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
             Some(('|', '|')) => Some(TokenKind::PipePipe),
             _ => None,
         };
-        if let Some(kind) = two { out.push(Token { kind, offset: start }); i += 2; continue; }
+        if let Some(kind) = two { out.push(Token { kind, pos: pos(start), end: pos(start + 2) }); i += 2; continue; }
         let kind = match x {
             '(' => TokenKind::LParen, ')' => TokenKind::RParen,
             '{' => TokenKind::LBrace, '}' => TokenKind::RBrace, ';' => TokenKind::Semicolon, ',' => TokenKind::Comma,
@@ -65,9 +96,9 @@ pub fn lex(source: &str) -> Result<Vec<Token>, String> {
             '+' => TokenKind::Plus, '-' => TokenKind::Minus, '*' => TokenKind::Star,
             '/' => TokenKind::Slash, '%' => TokenKind::Percent, z => TokenKind::Other(z),
         };
-        out.push(Token { kind, offset: start }); i += 1;
+        out.push(Token { kind, pos: pos(start), end: pos(start + 1) }); i += 1;
     }
-    out.push(Token { kind: TokenKind::End, offset: source.len() });
+    out.push(Token { kind: TokenKind::End, pos: pos(c.len()), end: pos(c.len()) });
     Ok(out)
 }
 
@@ -106,8 +137,50 @@ mod tests {
     #[test] fn comparison_tokens() { let t=lex("a<=b && a!=0 || !b").unwrap(); assert!(t.iter().any(|x|x.kind==TokenKind::LessEqual)); assert!(t.iter().any(|x|x.kind==TokenKind::AmpAmp)); assert!(t.iter().any(|x|x.kind==TokenKind::Bang)); }
     #[test] fn comma_token() { assert!(lex("f(a,b)").unwrap().iter().any(|t| t.kind == TokenKind::Comma)); }
     #[test] fn bad_comment() { assert!(lex("/*").is_err()); }
-    fn num(s: &str) -> Result<i64, String> {
+    fn num(s: &str) -> Result<i64, Diagnostic> {
         lex(s).map(|t| match t[0].kind { TokenKind::Number(n) => n, ref k => panic!("{k:?}") })
+    }
+    fn positions(source: &str) -> Vec<(u32, u32)> { lex(source).unwrap().iter().map(|t| (t.pos.line, t.pos.col)).collect() }
+    #[test] fn tokens_know_their_line_and_column() {
+        assert_eq!(positions("int a;\n  b = 1;"), vec![(1, 1), (1, 5), (1, 6), (2, 3), (2, 5), (2, 7), (2, 8), (2, 9)]);
+        // the end of input is just past the last character, on the empty line after a final newline
+        assert_eq!(positions("x\n").last(), Some(&(2, 1)));
+        assert_eq!(positions("x").last(), Some(&(1, 2)));
+        assert_eq!(positions(""), vec![(1, 1)]);
+    }
+    #[test] fn columns_count_characters_and_each_tab_is_one() {
+        assert_eq!(positions("\tx")[0], (1, 2));
+        assert_eq!(positions("/* é */ x")[0], (1, 9)); // multi-byte characters are one column
+        assert_eq!(positions("a\r\nb")[1], (2, 1)); // CRLF ends the line
+    }
+    #[test] fn comments_and_blank_lines_advance_the_line_count() {
+        assert_eq!(positions("// one\n\n  // three\nx")[0], (4, 1));
+        assert_eq!(positions("/* a\nb */ x")[0], (2, 6));
+        assert_eq!(positions("a /* x\n\n */ b")[1], (3, 5));
+    }
+    #[test] fn tokens_also_know_where_they_end() {
+        let t = lex("int ==\n  foo").unwrap();
+        let ends: Vec<_> = t.iter().map(|t| (t.end.line, t.end.col)).collect();
+        assert_eq!(ends, vec![(1, 4), (1, 7), (2, 6), (2, 6)]);
+    }
+    #[test] fn lexical_errors_carry_a_position() {
+        let at = |source: &str| lex(source).unwrap_err().pos.map(|p| (p.line, p.col));
+        assert_eq!(at("a /* x"), Some((1, 3)));
+        assert_eq!(at("ab\n  08"), Some((2, 3)));
+        assert_eq!(at("int x = 0x;"), Some((1, 9)));
+        assert_eq!(at("x = 99999999999999999999;"), Some((1, 5)));
+    }
+    #[test] fn tokens_are_described_the_way_c_writes_them() {
+        let d = |k: TokenKind| k.describe(|s| s == "int");
+        assert_eq!(d(TokenKind::Semicolon), "';'");
+        assert_eq!(d(TokenKind::AmpAmp), "'&&'");
+        assert_eq!(d(TokenKind::Ident("x".into())), "identifier 'x'");
+        assert_eq!(d(TokenKind::Ident("int".into())), "'int'");
+        assert_eq!(d(TokenKind::Number(7)), "number 7");
+        assert_eq!(d(TokenKind::End), "end of input");
+        assert_eq!(d(TokenKind::Other('$')), "'$'");
+        assert_eq!(d(TokenKind::Other('é')), "'é'");
+        assert_eq!(d(TokenKind::Other('\u{1}')), "'\\u{1}'");
     }
     #[test] fn decimal_octal_and_hex_literals() {
         assert_eq!(num("0"), Ok(0));

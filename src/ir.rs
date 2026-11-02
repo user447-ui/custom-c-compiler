@@ -1,4 +1,5 @@
 use crate::ast::{BinaryOp, Expr, Function, Program, Stmt, UnaryOp};
+use crate::diag::{Diagnostic, Pos};
 
 pub type ValueId = usize;
 pub type BlockId = usize;
@@ -15,6 +16,9 @@ pub struct IrFunction {
     pub value_count: usize,
     pub blocks: Vec<BasicBlock>,
     pub entry: BlockId,
+    /// Where each division or remainder is in the source (keyed by the value it defines),
+    /// to place warnings. Passes keep these values' numbers, so the map stays valid.
+    pub division_sites: std::collections::HashMap<ValueId, Pos>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -65,7 +69,7 @@ pub fn lower(program: &Program) -> IrModule {
 }
 
 fn lower_function(function: &Function) -> IrFunction {
-    let mut builder = Builder { locals: Vec::new(), value_count: 0, blocks: Vec::new(), current: 0 };
+    let mut builder = Builder { locals: Vec::new(), value_count: 0, blocks: Vec::new(), current: 0, division_sites: Default::default() };
     builder.new_block();
     // Parameters become ordinary locals initialised from the incoming arguments.
     for (index, name) in function.params.iter().enumerate() {
@@ -83,6 +87,7 @@ fn lower_function(function: &Function) -> IrFunction {
     IrFunction {
         name: function.name.clone(), param_count: function.params.len(),
         locals: builder.locals, value_count: builder.value_count, blocks: builder.blocks, entry: 0,
+        division_sites: builder.division_sites,
     }
 }
 
@@ -387,7 +392,7 @@ fn optimize_function(mut program: IrFunction) -> IrFunction {
 /// that a constant condition guards (`if (d != 0) x / d` with `d` known to be 0) is not
 /// reported. Constants are looked up across blocks (every value is defined exactly once), so
 /// `int z = 0; return 1 / z;` is caught as well as `1 / 0`.
-pub fn warnings(module: &IrModule) -> Vec<String> {
+pub fn warnings(module: &IrModule) -> Vec<Diagnostic> {
     let mut out = Vec::new();
     for function in &module.functions {
         let constants: std::collections::HashMap<ValueId, i32> = function.blocks.iter()
@@ -395,15 +400,14 @@ pub fn warnings(module: &IrModule) -> Vec<String> {
             .filter_map(|i| match i { Instruction::Const { dst, value } => Some((*dst, *value)), _ => None })
             .collect();
         for inst in function.blocks.iter().flat_map(|b| &b.instructions) {
-            let Instruction::Binary { op: op @ (IrBinary::Div | IrBinary::Rem), lhs, rhs, .. } = inst else { continue };
+            let Instruction::Binary { dst, op: op @ (IrBinary::Div | IrBinary::Rem), lhs, rhs } = inst else { continue };
             let (what, symbol) = if *op == IrBinary::Div { ("division", '/') } else { ("remainder", '%') };
-            match (constants.get(lhs).copied(), constants.get(rhs).copied()) {
-                (_, Some(0)) => out.push(format!(
-                    "in function '{}': integer {what} by zero; the program crashes if this runs", function.name)),
-                (Some(i32::MIN), Some(-1)) => out.push(format!(
-                    "in function '{}': INT_MIN {symbol} -1 overflows; the program crashes if this runs", function.name)),
-                _ => {}
-            }
+            let message = match (constants.get(lhs).copied(), constants.get(rhs).copied()) {
+                (_, Some(0)) => format!("in function '{}': integer {what} by zero; the program crashes if this runs", function.name),
+                (Some(i32::MIN), Some(-1)) => format!("in function '{}': INT_MIN {symbol} -1 overflows; the program crashes if this runs", function.name),
+                _ => continue,
+            };
+            out.push(Diagnostic::at(function.division_sites.get(dst).copied().unwrap_or_default(), message));
         }
     }
     out
@@ -555,6 +559,7 @@ fn fold_binary(op: IrBinary, a: i32, b: i32) -> Option<i32> {
 }
 
 struct Builder {
+    division_sites: std::collections::HashMap<ValueId, Pos>,
     locals: Vec<String>,
     value_count: usize,
     blocks: Vec<BasicBlock>,
@@ -584,14 +589,14 @@ impl Builder {
     fn statement(&mut self, s: &Stmt) {
         self.open_block();
         match s {
-            Stmt::Declaration { name, initializer } => {
+            Stmt::Declaration { name, initializer, .. } => {
                 if !self.locals.contains(name) { self.locals.push(name.clone()); }
                 if let Some(e) = initializer {
                     let src = self.expression(e);
                     self.emit(Instruction::StoreLocal { name: name.clone(), src });
                 }
             }
-            Stmt::Assignment { name, value } => {
+            Stmt::Assignment { name, value, .. } => {
                 let src = self.expression(value);
                 self.emit(Instruction::StoreLocal { name: name.clone(), src });
             }
@@ -627,8 +632,8 @@ impl Builder {
     }
     fn expression(&mut self, e: &Expr) -> ValueId {
         match e {
-            Expr::Number(value) => self.constant(i32::try_from(*value).expect("sema guarantees literals fit in int")),
-            Expr::Variable(name) => {
+            Expr::Number(value, _) => self.constant(i32::try_from(*value).expect("sema guarantees literals fit in int")),
+            Expr::Variable(name, _) => {
                 let dst = self.value(); self.emit(Instruction::LoadLocal { dst, name: name.clone() }); dst
             }
             Expr::Unary { op, expr } => {
@@ -639,16 +644,16 @@ impl Builder {
                 };
                 self.emit(Instruction::Unary { dst, op, src }); dst
             }
-            Expr::Call { name, args } => {
+            Expr::Call { name, args, .. } => {
                 let mut values = Vec::with_capacity(args.len());
                 for arg in args { values.push(self.expression(arg)); }
                 let dst = self.value();
                 self.emit(Instruction::Call { dst, callee: name.clone(), args: values });
                 dst
             }
-            Expr::Binary { op: BinaryOp::LogicalAnd, left, right } => self.logical(left, right, true),
-            Expr::Binary { op: BinaryOp::LogicalOr, left, right } => self.logical(left, right, false),
-            Expr::Binary { op, left, right } => {
+            Expr::Binary { op: BinaryOp::LogicalAnd, left, right, .. } => self.logical(left, right, true),
+            Expr::Binary { op: BinaryOp::LogicalOr, left, right, .. } => self.logical(left, right, false),
+            Expr::Binary { op, left, right, pos } => {
                 let lhs = self.expression(left); let rhs = self.expression(right); let dst = self.value();
                 let op = match op {
                     BinaryOp::Add=>IrBinary::Add, BinaryOp::Sub=>IrBinary::Sub, BinaryOp::Mul=>IrBinary::Mul,
@@ -659,6 +664,7 @@ impl Builder {
                     BinaryOp::Greater=>IrBinary::Greater, BinaryOp::GreaterEqual=>IrBinary::GreaterEqual,
                     BinaryOp::LogicalAnd|BinaryOp::LogicalOr => unreachable!(),
                 };
+                if matches!(op, IrBinary::Div | IrBinary::Rem) { self.division_sites.insert(dst, *pos); }
                 self.emit(Instruction::Binary { dst, op, lhs, rhs }); dst
             }
         }
@@ -888,11 +894,15 @@ mod tests {
             .all(|i| !matches!(i, Instruction::LoadLocal { .. } | Instruction::StoreLocal { .. })));
     }
     // ---- warnings for divisions that always fault -----------------------------------------
-    fn warnings_for(source: &str) -> Vec<String> {
+    fn diagnostics_for(source: &str) -> Vec<Diagnostic> {
         let ast = Parser::new(lex(source).unwrap()).parse().unwrap();
         let mut module = lower(&sema::analyze(&ast).unwrap());
         promote_locals_to_ssa(&mut module);
         warnings(&optimize(module))
+    }
+    fn warnings_for(source: &str) -> Vec<String> { diagnostics_for(source).into_iter().map(|d| d.message).collect() }
+    fn warned_at(source: &str) -> Vec<(u32, u32)> {
+        diagnostics_for(source).iter().map(|d| { let p = d.pos.expect("warning has a position"); (p.line, p.col) }).collect()
     }
     #[test] fn warns_about_division_and_remainder_by_zero() {
         let w = warnings_for("int main(void){ return 1 / 0; }");
@@ -901,6 +911,15 @@ mod tests {
         // the divisor is only known to be zero after folding
         assert_eq!(warnings_for("int main(void){ return 5 / (3 - 3); }").len(), 1);
         assert_eq!(warnings_for("int main(void){ return 5 % (2 * 0); }").len(), 1);
+    }
+    #[test] fn warnings_point_at_the_operator() {
+        assert_eq!(warned_at("int main(void){ return 1 / 0; }"), vec![(1, 26)]);
+        assert_eq!(warned_at("int f(int a){\n    return a\n        % 0;\n}\nint main(void){ return f(1); }"), vec![(3, 9)]);
+        // each division is reported where it is, even when they sit in one expression
+        assert_eq!(warned_at("int main(void){ int z = 0; return 8 / z + 9 % z; }"), vec![(1, 37), (1, 45)]);
+        // the position survives promotion and optimization of unrelated code
+        let w = warned_at("int main(void){ int a = 2; int b = a * 3; if (b > 4) { a = a + 1; } int z = 0; return a / z; }");
+        assert_eq!(w, vec![(1, 89)]);
     }
     #[test] fn warns_when_a_variable_is_known_to_be_zero() {
         assert_eq!(warnings_for("int main(void){ int z = 0; return 10 / z; }").len(), 1);
